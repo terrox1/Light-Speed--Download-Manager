@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LSDM — Aria2 Monitor</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg-glow" aria-hidden="true">
+    <span class="g1"></span>
+    <span class="g2"></span>
+    <span class="g3"></span>
+  </div>
+
+  <div class="container">
+    <div class="hero">
+      <p class="eyebrow">Live · Per-segment · 1s refresh</p>
+      <h1>Aria2 monitor</h1>
+      <p>Live speed and per-segment connection detail for downloads handed off to aria2's native engine.</p>
+    </div>
+
+    <div id="aria2-status" class="panel"></div>
+
+    <section class="panel">
+      <h2>Managed downloads</h2>
+      <div id="list"></div>
+      <p class="small" style="margin-top:14px;">Empty here but downloads are still moving on the main page? aria2 isn't connected — check that it's running with RPC enabled on <code>http://127.0.0.1:6800/jsonrpc</code>, or restart LSDM so it spawns the daemon automatically.</p>
+    </section>
+  </div>
+  <script src="/static/ariang.js"></script>
+</body>
+</html>

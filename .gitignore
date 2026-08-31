@@ -1,0 +1,23 @@
+# --- Personal files / downloaded content (NEVER commit) ---
+downloads/
+*.log
+*.aria2
+config.json
+
+# --- aria2 binaries & runtime state (users install via tools/install-aria2.ps1) ---
+tools/aria2/
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+
+# --- Build output (electron-builder) ---
+dist/
+release/
+out/
+
+# --- OS / editor junk ---
+.vscode/
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LSDM Downloader</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;800&family=Manrope:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+    :root {
+      --cyan: #22e8ff;
+      --violet: #b463ff;
+      --magenta: #ff5fd1;
+      --lime: #6bffb0;
+      --red: #ff5470;
+      --text-hi: #f1f5ff;
+      --text-mid: #9aa7c7;
+      --glass-border: rgba(255,255,255,0.12);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: 'Manrope', system-ui, sans-serif;
+      width: 300px;
+      padding: 16px;
+      margin: 0;
+      background: radial-gradient(circle at 20% 0%, #131a30 0%, #05070f 60%);
+      color: var(--text-hi);
+    }
+
+    h3 {
+      font-family: 'Orbitron', sans-serif;
+      font-weight: 800;
+      font-size: 1rem;
+      letter-spacing: 0.03em;
+      margin: 0 0 14px;
+      background: linear-gradient(100deg, var(--cyan), var(--violet), var(--magenta));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    label { display: block; margin-bottom: 12px; font-size: 0.8rem; color: var(--text-mid); font-weight: 600; }
+
+    input, button {
+      width: 100%;
+      padding: 9px 10px;
+      margin-top: 5px;
+      border-radius: 9px;
+      border: 1px solid var(--glass-border);
+      font-family: inherit;
+      font-size: 0.9rem;
+    }
+
+    input {
+      background: rgba(255,255,255,0.04);
+      color: var(--text-hi);
+      outline: none;
+    }
+    input:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(34,232,255,0.14); }
+
+    button {
+      background: linear-gradient(135deg, rgba(34,232,255,0.2), rgba(180,99,255,0.2));
+      color: var(--text-hi);
+      border: 1px solid rgba(255,255,255,0.18);
+      cursor: pointer;
+      font-weight: 700;
+      transition: box-shadow 180ms ease, transform 120ms ease;
+    }
+    button:hover { box-shadow: 0 0 16px rgba(34,232,255,0.35); transform: translateY(-1px); }
+
+    .info { margin-top: 10px; font-size: 0.82rem; font-family: 'JetBrains Mono', monospace; color: var(--text-mid); }
+    .error { color: var(--red); }
+    .success { color: var(--lime); }
+    .warning { color: #ffcf6b; }
+  </style>
+</head>
+<body>
+  <h3>LSDM Link Sender</h3>
+  <label>
+    File URL / Magnet Link
+    <input id="url" type="url" placeholder="https://example.com/file.zip or magnet:?xt=..." />
+  </label>
+  <label>
+    Save as (optional)
+    <input id="filename" type="text" placeholder="file.zip" />
+  </label>
+  <label>
+    Split count
+    <input id="split" type="number" min="1" max="32" value="16" />
+  </label>
+  <label>
+    Connections per server
+    <input id="maxConnections" type="number" min="1" max="16" value="16" />
+  </label>
+  <button id="send">Send to LSDM</button>
+  <label style="display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;">
+    <input type="checkbox" id="autoCapture" checked style="width:auto; margin:0; accent-color:#22e8ff;" />
+    <span style="font-size:0.78rem; color:var(--text-mid); font-weight:600;">Auto-capture browser downloads</span>
+  </label>
+  <div id="serverStatus" class="info"></div>
+  <button id="openUi" style="margin-top:10px;">Open LSDM UI</button>
+  <button id="openMonitor" style="margin-top:8px;">Open Monitor</button>
+  <div id="status" class="info"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

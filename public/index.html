@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LSDM Pro</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body class="app-window">
+  <!-- Custom Windows Frameless Titlebar -->
+  <header class="titlebar">
+    <div class="titlebar-drag">
+      <span class="app-badge">LSDM</span>
+      <span class="app-title">Light Speed Download Manager Pro</span>
+    </div>
+    <div class="window-controls">
+      <button id="win-min" title="Minimize">&#x2014;</button>
+      <button id="win-max" title="Maximize">&#x25A2;</button>
+      <button id="win-close" title="Close" class="win-close-btn">&#x2715;</button>
+    </div>
+  </header>
+
+  <div class="app-layout">
+    <!-- IDM Left Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-glow"></div>
+        <h2>CATEGORIES</h2>
+      </div>
+
+      <nav class="nav-group">
+        <button class="nav-item active" data-tab="all">
+          <span class="nav-label">All Downloads</span>
+          <span class="badge" id="badge-all">0</span>
+        </button>
+        <button class="nav-item" data-tab="downloading">
+          <span class="nav-label">Downloading</span>
+          <span class="badge badge-active" id="badge-downloading">0</span>
+        </button>
+        <button class="nav-item" data-tab="torrents">
+          <span class="nav-label">Torrents</span>
+          <span class="badge" id="badge-torrents">0</span>
+        </button>
+        <button class="nav-item" data-tab="completed">
+          <span class="nav-label">Completed</span>
+          <span class="badge" id="badge-completed">0</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-section-title">MEDIA & FILES</div>
+      <nav class="nav-group">
+        <button class="nav-item" data-tab="videos">
+          <span class="nav-icon">🎬</span>
+          <span class="nav-label">Videos / M3U8</span>
+        </button>
+        <button class="nav-item" data-tab="compressed">
+          <span class="nav-icon">🗜️</span>
+          <span class="nav-label">Compressed</span>
+        </button>
+        <button class="nav-item" data-tab="programs">
+          <span class="nav-icon">⚙️</span>
+          <span class="nav-label">Programs</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button class="nav-item" data-tab="extension">
+          <span class="nav-icon">🧩</span>
+          <span class="nav-label">Browser Ext</span>
+        </button>
+        <button class="nav-item" data-tab="settings">
+          <span class="nav-icon">🛠️</span>
+          <span class="nav-label">Settings</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-viewport">
+      <!-- Top Action Toolbar -->
+      <section class="toolbar">
+        <button id="btn-add-url" class="tool-btn primary">
+          <span>➕</span> Add URL / Torrent
+        </button>
+        <button id="btn-resume-all" class="tool-btn">
+          <span>▶️</span> Resume All
+        </button>
+        <button id="btn-pause-all" class="tool-btn">
+          <span>⏸️</span> Pause All
+        </button>
+        <button id="btn-clear-completed" class="tool-btn danger">
+          <span>🗑️</span> Clear Finished
+        </button>
+
+        <div class="toolbar-stats">
+          <div class="stat-box">
+            <span class="stat-label">GLOBAL SPEED</span>
+            <span class="stat-val speed" id="global-speed">0.0 MB/s</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">ACTIVE THREADS</span>
+            <span class="stat-val" id="global-threads">0</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab View: Task Grid -->
+      <section id="view-downloads" class="tab-view active">
+        <div class="table-header">
+          <div class="th th-name">File Name</div>
+          <div class="th th-size">Size</div>
+          <div class="th th-status">Status & Progress</div>
+          <div class="th th-speed">Speed</div>
+          <div class="th th-eta">Connections</div>
+          <div class="th th-actions">Actions</div>
+        </div>
+        <div id="tasks-table-body" class="tasks-table-body">
+          <!-- Dynamic task rows render here -->
+        </div>
+      </section>
+
+      <!-- Tab View: Extension Integration -->
+      <section id="view-extension" class="tab-view">
+        <div class="settings-card">
+          <h2>Browser Extension Integration</h2>
+          <p>The LSDM Chrome/Edge extension enables 1-click video sniffing (MP4, HLS/M3U8) and auto-captures browser downloads.</p>
+          <div class="status-pill connected">Extension Bridge Listening on Port 3000</div>
+          <ol class="step-list">
+            <li>Open <code>chrome://extensions</code> in Chrome, Brave, or Edge.</li>
+            <li>Enable <b>Developer mode</b> (top right).</li>
+            <li>Click <b>Load unpacked</b> and select your project's <code>extension/</code> folder.</li>
+          </ol>
+        </div>
+      </section>
+
+<!-- Tab View: Settings -->
+<section id="view-settings" class="tab-view">
+  <div class="settings-card">
+    <h2>Application & Storage Settings</h2>
+    
+    <div class="setting-row">
+      <div style="flex: 1;">
+        <strong>Default Download Directory</strong>
+        <div class="sub-text">Where downloaded files and torrents are saved on your PC.</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <input type="text" id="setting-download-path" class="inline-input" style="flex: 1;" readonly />
+          <button id="btn-browse-path" class="tool-btn">Browse...</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <strong>Default Connections per File</strong>
+        <div class="sub-text">Recommended: 16 threads for saturating high-bandwidth connections.</div>
+      </div>
+      <input type="number" id="setting-threads" value="16" min="1" max="64" class="inline-input" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <strong>Disk Cache Size</strong>
+        <div class="sub-text">RAM buffer allocated before flushing chunks to SSD.</div>
+      </div>
+      <select id="setting-cache" class="inline-input">
+        <option value="64M">64 MB</option>
+        <option value="128M" selected>128 MB (High Speed)</option>
+        <option value="256M">256 MB</option>
+      </select>
+    </div>
+
+    <div style="margin-top: 20px; display: flex; justify-content: flex-end;">
+      <button id="btn-save-settings" class="btn-cyan">Save Settings</button>
+    </div>
+  </div>
+</section>
+    </main>
+  </div>
+
+  <!-- Complete Add Download / Torrent Modal -->
+<div id="add-modal" class="modal-backdrop">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3>Add Download / Torrent</h3>
+      <button id="modal-close" class="close-x" type="button" title="Close">&times;</button>
+    </div>
+    
+    <div class="modal-body">
+      <label for="modal-url">URL or Magnet Link</label>
+      <input id="modal-url" type="text" placeholder="https://example.com/file.zip or magnet:?xt=..." autocomplete="off" />
+
+      <div class="modal-file-upload">
+        <label for="modal-torrent-file">Or Select a .torrent File</label>
+        <input type="file" id="modal-torrent-file" accept=".torrent" />
+      </div>
+
+      <div class="modal-row">
+        <div style="flex: 2;">
+          <label for="modal-filename">Save As (Optional)</label>
+          <input id="modal-filename" type="text" placeholder="file.zip" />
+        </div>
+        <div style="flex: 1;">
+          <label for="modal-split">Connections</label>
+          <input id="modal-split" type="number" value="16" min="1" max="32" />
+        </div>
+      </div>
+
+      <div id="modal-error" class="modal-error" role="alert" aria-live="polite"></div>
+    </div>
+
+    <div class="modal-footer">
+      <button id="modal-cancel" class="btn-ghost" type="button">Cancel</button>
+      <button id="modal-start" class="btn-cyan" type="button">Start Download</button>
+    </div>
+  </div>
+</div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Download File</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <style>
+    body {
+      padding: 20px;
+      margin: 0;
+      background: #080c1b;
+      color: #f1f5ff;
+      font-family: 'Manrope', system-ui, sans-serif;
+      user-select: none;
+    }
+    h2 {
+      font-size: 1.05rem;
+      color: var(--cyan);
+      margin: 0 0 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .form-group { margin-bottom: 12px; }
+    .form-group label {
+      display: block;
+      font-size: 0.76rem;
+      font-weight: 700;
+      color: #8c9bbd;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .form-group input, .form-group select {
+      width: 100%;
+      padding: 10px 12px;
+      font-size: 0.88rem;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 8px;
+      color: #fff;
+      outline: none;
+      box-sizing: border-box;
+    }
+    .form-group input:focus, .form-group select:focus {
+      border-color: var(--cyan);
+      box-shadow: 0 0 10px rgba(34, 232, 255, 0.25);
+    }
+    .row { display: flex; gap: 12px; }
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 24px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      padding-top: 16px;
+    }
+    .btn-download {
+      background: linear-gradient(135deg, #22e8ff, #6bffb0);
+      color: #05070f !important;
+      font-weight: 800;
+      border: none;
+      padding: 10px 22px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      box-shadow: 0 0 16px rgba(34, 232, 255, 0.3);
+    }
+    .btn-download:hover { transform: translateY(-1px); box-shadow: 0 0 20px rgba(34, 232, 255, 0.5); }
+  </style>
+</head>
+<body>
+  <h2 id="prompt-heading">⚡ Add Download Task</h2>
+  
+  <div class="form-group">
+    <label>Download Source / URL</label>
+    <input id="prompt-url" type="text" readonly style="color:var(--cyan); font-family:var(--font-mono); font-size:0.8rem;" />
+  </div>
+
+  <div class="row">
+    <div class="form-group" style="flex:2;">
+      <label>Save Name</label>
+      <input id="prompt-filename" type="text" placeholder="filename.ext" />
+    </div>
+    <div class="form-group" style="flex:1;">
+      <label id="split-label">Connections</label>
+      <input id="prompt-split" type="number" value="16" min="1" max="64" />
+    </div>
+  </div>
+
+  <div class="form-group">
+    <label>Category</label>
+    <select id="prompt-category">
+      <option value="General">General</option>
+      <option value="Torrents">Torrents / Magnets</option>
+      <option value="Compressed">Compressed (.zip, .rar, .iso)</option>
+      <option value="Videos">Videos (.mp4, .mkv, .ts)</option>
+      <option value="Programs">Programs (.exe, .msi, .apk)</option>
+    </select>
+  </div>
+
+  <div class="actions">
+    <button id="btn-cancel" class="btn-ghost" type="button">Cancel</button>
+    <button id="btn-start" class="btn-download" type="button">Download Now</button>
+  </div>
+
+  <script>
+    const urlInput = document.getElementById('prompt-url');
+    const filenameInput = document.getElementById('prompt-filename');
+    const splitInput = document.getElementById('prompt-split');
+    const splitLabel = document.getElementById('split-label');
+    const categorySelect = document.getElementById('prompt-category');
+    const heading = document.getElementById('prompt-heading');
+
+    window.electronAPI.onSetUrl((url) => {
+      urlInput.value = url;
+      const isMagnet = url.startsWith('magnet:?');
+
+      if (isMagnet) {
+        heading.innerHTML = '🧲 Add BitTorrent Magnet';
+        categorySelect.value = 'Torrents';
+        splitLabel.textContent = 'Max Peers';
+        splitInput.value = '150';
+
+        // Parse DN (Display Name) from Magnet Query
+        try {
+          const params = new URLSearchParams(url.replace(/^magnet:\?/i, ''));
+          const dn = params.get('dn');
+          filenameInput.value = dn ? decodeURIComponent(dn) : 'Fetching torrent metadata...';
+        } catch {
+          filenameInput.value = 'BitTorrent Transfer';
+        }
+      } else {
+        heading.innerHTML = '⚡ Add Direct Download';
+        splitLabel.textContent = 'Connections';
+        splitInput.value = '16';
+        try {
+          const parsed = new URL(url);
+          const name = parsed.pathname.split('/').pop();
+          if (name) filenameInput.value = decodeURIComponent(name);
+
+          if (/\.(zip|rar|7z|tar|iso)$/i.test(name)) categorySelect.value = 'Compressed';
+          else if (/\.(mp4|mkv|webm|ts|m3u8)$/i.test(name)) categorySelect.value = 'Videos';
+          else if (/\.(exe|msi|apk)$/i.test(name)) categorySelect.value = 'Programs';
+          else categorySelect.value = 'General';
+        } catch {}
+      }
+    });
+
+    document.getElementById('btn-cancel').addEventListener('click', () => {
+      window.electronAPI.closePrompt();
+    });
+
+    document.getElementById('btn-start').addEventListener('click', async () => {
+      const url = urlInput.value.trim();
+      const fileName = filenameInput.value.trim();
+      const split = Number(splitInput.value) || 16;
+      const category = categorySelect.value;
+
+      await fetch('http://127.0.0.1:3000/api/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, fileName, split, maxConnectionPerServer: split, category })
+      });
+
+      window.electronAPI.closePrompt();
+    });
+  </script>
+</body>
+</html>
