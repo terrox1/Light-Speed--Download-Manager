@@ -6,6 +6,26 @@ $ErrorActionPreference = 'Stop'
 $toolsDir = Join-Path -Path (Get-Location) -ChildPath 'tools'
 $ariaDir = Join-Path -Path $toolsDir -ChildPath 'aria2'
 $zipPath = Join-Path -Path $toolsDir -ChildPath 'aria2_latest.zip'
+$RpcPort = 6800
+
+# Conflict detection: a second aria2 won't be able to bind RPC. Probe
+# locally first so we don't drop the user into an infinite 3-second
+# restart loop when LSDM (or another install) already owns the daemon.
+function Test-Aria2Alive {
+  param([int]$Port)
+  try {
+    $client = New-Object System.Net.Sockets.TcpClient
+    $iar = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+    $ok = $iar.AsyncWaitHandle.WaitOne(500)
+    if ($ok) {
+      $client.EndConnect($iar)
+      $client.Close()
+      return $true
+    }
+    $client.Close()
+  } catch {}
+  return $false
+}
 
 if (-Not (Test-Path $toolsDir)) { New-Item -ItemType Directory -Path $toolsDir | Out-Null }
 
@@ -48,6 +68,14 @@ if ($existingAriaExe) {
 
 Write-Host "Starting aria2 with RPC enabled..."
 Write-Host "aria2 path: $ariaPath"
+
+if (Test-Aria2Alive -Port $RpcPort) {
+  Write-Host ""
+  Write-Host "An aria2 RPC endpoint is already responding on port $RpcPort - likely LSDM's daemon." -ForegroundColor Yellow
+  Write-Host "Skipping second instance to avoid an infinite PORT-already-bound restart loop." -ForegroundColor Yellow
+  Write-Host "If you really want to swap daemons, close LSDM first (or 'aria2.shutdown' via RPC), then re-run this script."
+  exit 0
+}
 
 # Launch through the supervisor script in a new window. Unlike a plain fire-and-forget
 # process, this logs all aria2 output to tools\aria2\logs\aria2.log and automatically

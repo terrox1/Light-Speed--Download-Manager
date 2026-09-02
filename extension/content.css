@@ -1,9 +1,15 @@
 #lsdm-sniffer-widget {
+  /* Capped at 9999 so any per-site modal (>9999) renders above the widget.
+     2147483647 used to be the value, but that hides behind absolutely-
+     positioned launchers that expect a sensible stacking order. */
   position: fixed;
   bottom: 24px;
   right: 24px;
-  z-index: 2147483647;
+  z-index: 2147483646;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  /* Hint the browser: doesn't visually interact with site modals; the user
+     actively accepts it. */
+  pointer-events: auto;
 }
 
 .lsdm-widget-card {

@@ -71,7 +71,7 @@
 </head>
 <body>
   <h2 id="prompt-heading">⚡ Add Download Task</h2>
-  
+
   <div class="form-group">
     <label>Download Source / URL</label>
     <input id="prompt-url" type="text" readonly style="color:var(--cyan); font-family:var(--font-mono); font-size:0.8rem;" />
@@ -84,18 +84,18 @@
     </div>
     <div class="form-group" style="flex:1;">
       <label id="split-label">Connections</label>
-      <input id="prompt-split" type="number" value="16" min="1" max="64" />
+      <input id="prompt-split" type="number" value="16" min="1" max="16" />
     </div>
   </div>
 
   <div class="form-group">
     <label>Category</label>
     <select id="prompt-category">
-      <option value="General">General</option>
-      <option value="Torrents">Torrents / Magnets</option>
-      <option value="Compressed">Compressed (.zip, .rar, .iso)</option>
-      <option value="Videos">Videos (.mp4, .mkv, .ts)</option>
-      <option value="Programs">Programs (.exe, .msi, .apk)</option>
+      <option value="General" data-allowed="http,https">General</option>
+      <option value="Torrents" data-allowed="magnet">Torrents / Magnets</option>
+      <option value="Compressed" data-allowed="http,https">Compressed (.zip, .rar, .iso)</option>
+      <option value="Videos" data-allowed="http,https">Videos (.mp4, .mkv, .ts)</option>
+      <option value="Programs" data-allowed="http,https">Programs (.exe, .msi, .apk)</option>
     </select>
   </div>
 
@@ -116,10 +116,32 @@
       urlInput.value = url;
       const isMagnet = url.startsWith('magnet:?');
 
+      // Helper: enable/disable categories based on URL type. Magnets only
+      // make sense for the "Torrents / Magnets" bucket; locking the
+      // dropdown prevents users accidentally forcing a magnet into Videos.
+      function applyCategoryLock(allowedWhere) {
+        for (const opt of categorySelect.options) {
+          const ok = opt.dataset.allowed?.split(',').includes(allowedWhere);
+          opt.disabled = !ok;
+          opt.hidden = !ok;
+        }
+        // Make sure the current value is still legal.
+        if (categorySelect.selectedOptions[0]?.disabled) {
+          for (const opt of categorySelect.options) {
+            if (!opt.disabled) { categorySelect.value = opt.value; break; }
+          }
+        }
+      }
+
       if (isMagnet) {
         heading.innerHTML = '🧲 Add BitTorrent Magnet';
+        applyCategoryLock('magnet');
         categorySelect.value = 'Torrents';
         splitLabel.textContent = 'Max Peers';
+        // bt-max-peers ceiling: aria2 itself caps at 200, our daemon passes
+        // 150. Allow 50..200 so power users can poke the swarm harder.
+        splitInput.min = '50';
+        splitInput.max = '200';
         splitInput.value = '150';
 
         // Parse DN (Display Name) from Magnet Query
@@ -132,6 +154,10 @@
         }
       } else {
         heading.innerHTML = '⚡ Add Direct Download';
+        // Connections is 1..16 because per-host + global caps already exist.
+        splitInput.min = '1';
+        splitInput.max = '16';
+        applyCategoryLock('http,https');
         splitLabel.textContent = 'Connections';
         splitInput.value = '16';
         try {
@@ -157,13 +183,21 @@
       const split = Number(splitInput.value) || 16;
       const category = categorySelect.value;
 
-      await fetch('http://127.0.0.1:3000/api/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, fileName, split, maxConnectionPerServer: split, category })
-      });
-
-      window.electronAPI.closePrompt();
+      // Use the renderer-detected server port instead of hardcoding :3000 so
+      // future env overrides (e.g. PORT=4000 npm start) keep working.
+      const port = await window.electronAPI.getServerPort();
+      const startBtn = document.getElementById('btn-start');
+      startBtn.disabled = true;
+      startBtn.textContent = 'Sending…';
+      try {
+        await fetch(`http://127.0.0.1:${port}/api/download`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, fileName, split, maxConnectionPerServer: split, category })
+        });
+      } finally {
+        window.electronAPI.closePrompt();
+      }
     });
   </script>
 </body>

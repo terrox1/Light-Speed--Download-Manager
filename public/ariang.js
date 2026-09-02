@@ -30,9 +30,10 @@ async function fetchStatus() {
 function formatBytes(bytes) {
   if (!bytes && bytes !== 0) return '-';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let index = 0; let value = bytes;
+  let index = 0; let value = Math.abs(bytes);
   while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
-  return `${value.toFixed(1)} ${units[index]}`;
+  const dp = value < 10 ? 2 : value < 100 ? 1 : 0;
+  return `${value.toFixed(dp)} ${units[index]}`;
 }
 
 function speedStr(bps) { // bytes/sec
@@ -40,7 +41,8 @@ function speedStr(bps) { // bytes/sec
   const units = ['B/s','KB/s','MB/s','GB/s'];
   let i = 0; let v = bps;
   while (v >= 1024 && i < units.length-1) { v /= 1024; i += 1; }
-  return `${v.toFixed(1)} ${units[i]}`;
+  const dp = v < 10 ? 2 : v < 100 ? 1 : 0;
+  return `${v.toFixed(dp)} ${units[i]}`;
 }
 
 // Incremental row cache: gid -> refs

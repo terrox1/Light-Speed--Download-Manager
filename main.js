@@ -1,5 +1,5 @@
 // main.js
-const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, shell, dialog, Notification } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, shell, dialog, Notification, nativeImage } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -9,8 +9,30 @@ const fs = require('fs');
 const SERVER_PORT = 3000;
 process.env.PORT = String(SERVER_PORT);
 
+// Single-instance guard. Without this, two LSDM windows race for the same
+// internal port and silently screw each other up. We acquire the lock BEFORE
+// requiring server.js so the second instance never even opens a socket. The
+// first instance gets a 'second-instance' event so it can pop its window.
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  // eslint-disable-next-line no-console
+  console.log('[lsdm] another instance is already running — exiting.');
+  app.exit(0);
+  process.exit(0);
+}
+
 // Start internal Express server
 require('./server.js');
+
+// When a second instance is launched (e.g. a user double-clicked the .exe),
+// surface the existing window instead of opening a duplicate.
+app.on('second-instance', () => {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isVisible()) mainWindow.show();
+  mainWindow.moveTop();
+  mainWindow.focus();
+});
 
 let mainWindow = null;
 let promptWindow = null;
@@ -21,9 +43,20 @@ let clipboardWatcher = null;
 
 const ARIA_PORT = 6800;
 
-// Auto-locate aria2c.exe inside tools directory
+// Auto-locate aria2c.exe inside tools directory.
+// Packaging-aware: electron-builder unpacks tools/ to app.asar.unpacked so the
+// spawned exe can actually execute (Windows can't exec from inside an asar).
 function findAriaExecutable() {
-  const toolsDir = path.join(__dirname, 'tools');
+  const candidates = [
+    __dirname.replace('app.asar', 'app.asar.unpacked'), // packaged location
+    __dirname,                                          // dev location
+  ];
+  for (const base of candidates) {
+    const found = scan(path.join(base, 'tools'));
+    if (found) return found;
+  }
+  return null;
+
   function scan(dir) {
     if (!fs.existsSync(dir)) return null;
     const files = fs.readdirSync(dir);
@@ -38,7 +71,6 @@ function findAriaExecutable() {
     }
     return null;
   }
-  return scan(toolsDir);
 }
 
 // In main.js
@@ -53,6 +85,11 @@ function startAriaDaemon() {
   const logDir = path.join(ariaDir, 'logs');
   if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
   const logPath = path.join(logDir, 'aria2.log');
+  // Persistence: keep an aria2.session file next to the log so unfinished
+  // downloads are restored after a restart. The session is also rewritten
+  // every 30s by aria2 itself (--save-session-interval=30), but we also
+  // force a saveSession/shutdown RPC on graceful quit (below).
+  const sessionPath = path.join(ariaDir, 'aria2.session');
 
   // 100% verified, stable high-speed flags
 // In main.js -> inside startAriaDaemon()
@@ -96,6 +133,12 @@ const args = [
   '--dht-entry-point=router.bittorrent.com:6881',
   '--dht-entry-point6=dht.transmissionbt.com:6881',
   '--dht-file-path=' + path.join(ariaDir, 'dht.dat'),
+  // Resume support: aria2 reads this file at startup, restarts every task
+  // that wasn't finished, and rewrites it every 30s. Combined with the
+  // saveSession/shutdown RPC on graceful quit, no download is ever silently
+  // orphaned between LSDM sessions.
+  '--save-session=' + sessionPath,
+  '--save-session-interval=30',
   '--bt-min-crypto-level=plain',
   '--bt-require-crypto=false',
   '--seed-time=0',
@@ -167,27 +210,49 @@ function createDownloadPrompt(url) {
 }
 
 function createMainWindow() {
-mainWindow = new BrowserWindow({
-  width: 1180,
-  height: 760,
-  minWidth: 850,
-  minHeight: 550,
-  frame: false, // Enables native custom titlebar
-  backgroundColor: '#070913',
-  webPreferences: {
-    preload: path.join(__dirname, 'preload.js'),
-    nodeIntegration: false,
-    contextIsolation: true
-  }
-});
+  mainWindow = new BrowserWindow({
+    width: 1180,
+    height: 760,
+    minWidth: 850,
+    minHeight: 550,
+    frame: false, // Enables native custom titlebar
+    backgroundColor: '#070913',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true
+    }
+  });
 
-// IPC handlers for titlebar controls
-ipcMain.on('window:minimize', () => mainWindow?.minimize());
-ipcMain.on('window:maximize', () => {
-  if (mainWindow?.isMaximized()) mainWindow.unmaximize();
-  else mainWindow?.maximize();
-});
-ipcMain.on('window:close', () => mainWindow?.hide());
+  // Titlebar controls. The max handler also pushes the new state back to the
+  // renderer so the titlebar glyph (▢ vs ❐) actually reflects what Windows
+  // thinks, not what the renderer last clicked.
+  ipcMain.on('window:minimize', () => mainWindow?.minimize());
+  ipcMain.on('window:maximize', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMaximized()) mainWindow.unmaximize();
+    else mainWindow.maximize();
+    mainWindow.webContents.send(
+      'window:maximized-state',
+      mainWindow.isMaximized(),
+    );
+  });
+  ipcMain.on('window:close', () => mainWindow?.hide());
+
+  mainWindow.on('maximize', () => {
+    mainWindow.webContents.send('window:maximized-state', true);
+  });
+  mainWindow.on('unmaximize', () => {
+    mainWindow.webContents.send('window:maximized-state', false);
+  });
+  mainWindow.on('resize', () => {
+    // Defensive: Windows sometimes reports unmaximize without firing the
+    // event after an OS-driven snap (Win+arrow). Always piggyback on resize.
+    mainWindow.webContents.send(
+      'window:maximized-state',
+      mainWindow.isMaximized(),
+    );
+  });
 
   mainWindow.loadURL(`http://127.0.0.1:${SERVER_PORT}`);
 
@@ -200,10 +265,30 @@ ipcMain.on('window:close', () => mainWindow?.hide());
 }
 
 function createTray() {
-  // Using public icon or standard tray fallback
-  tray = new Tray(path.join(__dirname, 'public', 'favicon.ico'));
+  // Loads favicon.ico from public/ and rescales to the standard 16x16 tray
+  // size so it stays crisp on Windows hi-DPI displays. We deliberately don't
+  // bail if the file is missing — fall back to an airwatch icon so the tray
+  // is always present (the user can still see LSDM is running).
+  const icoPath = path.join(__dirname, 'public', 'favicon.ico');
+  let img;
+  try {
+    img = nativeImage.createFromPath(icoPath);
+    if (img.isEmpty()) img = nativeImage.createEmpty();
+    else img = img.resize({ width: 16, height: 16 });
+  } catch (err) {
+    console.warn('[lsdm] tray icon load failed:', err?.message || err);
+    img = nativeImage.createEmpty();
+  }
+  tray = new Tray(img);
   const contextMenu = Menu.buildFromTemplate([
-    { label: 'Open LSDM', click: () => { mainWindow.show(); mainWindow.focus(); } },
+    { label: 'Open LSDM', click: () => {
+        if (!mainWindow) return;
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        if (!mainWindow.isVisible()) mainWindow.show();
+        mainWindow.moveTop();
+        mainWindow.focus();
+      }
+    },
     { label: 'Aria2 Monitor', click: () => shell.openExternal(`http://127.0.0.1:${SERVER_PORT}/ariang`) },
     { type: 'separator' },
     { label: 'Exit', click: () => { app.isQuitting = true; app.quit(); } }
@@ -212,7 +297,9 @@ function createTray() {
   tray.setToolTip('LSDM — Running');
   tray.setContextMenu(contextMenu);
   tray.on('double-click', () => {
-    mainWindow.show();
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    if (!mainWindow.isVisible()) mainWindow.show();
     mainWindow.focus();
   });
 }
@@ -220,38 +307,70 @@ function createTray() {
 // Windows Clipboard Sniffer
 function startClipboardWatcher() {
   const downloadPattern = /^(https?:\/\/|magnet:\?xt=).*\.(zip|rar|7z|tar|gz|iso|exe|msi|mp4|mkv|mov|ts|m3u8|pdf|epub)(\?.*)?$/i;
-  const recentPrompts = new Map(); // url -> timestamp of last prompt
-  const PROMPT_COOLDOWN = 5 * 60 * 1000; // Don't re-prompt same URL within 5 minutes
+  // url -> { lastPromptAt, lastSeenState }. Tracks BOTH the prompt cooldown
+  // and the latest task state we observed for the URL — so we don't re-prompt
+  // when the user re-copies a completed/failed URL a minute later, and don't
+  // re-fire just because the task transitioned out of `downloading`.
+  const recentPrompts = new Map();
+  const PROMPT_COOLDOWN = 5 * 60 * 1000; // hard cap on repeated prompts
+  // Terminal-state set: once a URL is in any of these, we won't prompt again
+  // until the user actively removes the task or the cooldown window expires.
+  const TERMINAL_STATES = new Set([
+    'error', 'failed', 'complete', 'cancelled', 'removed',
+  ]);
 
   // Keep the handle so before-quit can stop the watcher cleanly
   clipboardWatcher = setInterval(async () => {
+    const now = Date.now();
     // Memory fix: prune expired cooldown entries so the map can't grow
     // unbounded over long-running sessions.
-    const now = Date.now();
-    for (const [url, ts] of recentPrompts) {
-      if (now - ts >= PROMPT_COOLDOWN) recentPrompts.delete(url);
+    for (const [url, info] of recentPrompts) {
+      if (now - info.lastPromptAt >= PROMPT_COOLDOWN) recentPrompts.delete(url);
     }
     const text = clipboard.readText().trim();
     if (text && text !== lastClipboardText) {
       lastClipboardText = text;
       if (downloadPattern.test(text) || text.startsWith('magnet:?')) {
         // Skip if we already prompted for this URL recently
-        const last = recentPrompts.get(text) || 0;
-        if (Date.now() - last < PROMPT_COOLDOWN) return;
+        const info = recentPrompts.get(text);
+        if (info && now - info.lastPromptAt < PROMPT_COOLDOWN) return;
 
-        // Skip if this URL is already an active download in the server
+        // Skip if the URL matches an active or terminal-state task: the user
+        // either already has it, or it just finished and we don't want to
+        // pester them about a re-copy. They can re-add manually.
         try {
           const res = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/status`);
           if (res.ok) {
             const activeTasks = await res.json();
-            const alreadyActive = activeTasks.some(t =>
-              t.url === text && !['error', 'failed', 'complete'].includes(t.state)
-            );
-            if (alreadyActive) return;
+            const match = activeTasks.find((t) => t.url === text);
+            if (match) {
+              // Update lastSeenState so a race where the task goes terminal
+              // *after* this check doesn't immediately re-fire.
+              recentPrompts.set(text, {
+                lastPromptAt: info?.lastPromptAt ?? 0,
+                lastSeenState: match.state,
+              });
+              // We only swallow the prompt when the matching task is still
+              // useful (downloading) or already terminal — those are the two
+              // states where re-prompting would be useless/nagging.
+              if (
+                match.progress < 100 &&
+                !TERMINAL_STATES.has(match.state) &&
+                match.state !== 'paused'
+              ) {
+                return;
+              }
+              if (TERMINAL_STATES.has(match.state)) {
+                // If the URL was already completed/failed, only re-prompt
+                // after the cooldown window. lastPromptAt stays at its old
+                // value so a fresh cooldown check applies.
+                if (info && now - info.lastPromptAt < PROMPT_COOLDOWN) return;
+              }
+            }
           }
         } catch {}
 
-        recentPrompts.set(text, Date.now());
+        recentPrompts.set(text, { lastPromptAt: now, lastSeenState: null });
         createDownloadPrompt(text);
       }
     }
@@ -266,22 +385,43 @@ ipcMain.handle('dialog:open-directory', async () => {
   return canceled ? null : filePaths[0];
 });
 
-// Open a folder/file in Explorer (e.g. "Open downloads folder" button)
+// Open a folder/file in Explorer (e.g. "Open downloads folder" button).
+// SECURITY: we strictly refuse anything that isn't a directory. The renderer
+// can pass ANY string here via XSS or a future bug, and shell.openPath()
+// happily executes .exe paths on Windows — this used to be the only path
+// between a compromised tab and `cmd.exe`.
 ipcMain.handle('shell:open-path', async (_event, targetPath) => {
   try {
-    if (targetPath && fs.existsSync(targetPath)) {
-      await shell.openPath(targetPath);
-      return true;
+    if (!targetPath || typeof targetPath !== 'string') {
+      if (Notification.isSupported()) {
+        new Notification({ title: 'LSDM', body: 'No folder was provided.' }).show();
+      }
+      return false;
     }
-    // Surface the failure instead of silently returning false — the renderer
-    // never showed any feedback when the folder was missing/unreachable.
-    if (Notification.isSupported()) {
-      new Notification({
-        title: 'LSDM',
-        body: `Folder not found: ${targetPath || '(empty path)'}`
-      }).show();
+    const resolved = path.resolve(targetPath);
+    if (!fs.existsSync(resolved)) {
+      if (Notification.isSupported()) {
+        new Notification({
+          title: 'LSDM',
+          body: `Folder not found: ${targetPath}`,
+        }).show();
+      }
+      return false;
     }
-    return false;
+    const stat = fs.statSync(resolved);
+    if (!stat.isDirectory()) {
+      // Refuse files (incl. executables) so this can't be weaponised. The
+      // only legitimate use is opening the downloads folder.
+      if (Notification.isSupported()) {
+        new Notification({
+          title: 'LSDM',
+          body: 'Only folders can be opened (not files).',
+        }).show();
+      }
+      return false;
+    }
+    await shell.openPath(resolved);
+    return true;
   } catch (err) {
     if (Notification.isSupported()) {
       new Notification({ title: 'LSDM', body: `Could not open folder: ${err.message}` }).show();
@@ -302,6 +442,32 @@ ipcMain.on('app:notify', (_event, { title, body }) => {
 // Expose the internal server port to the renderer
 ipcMain.handle('app:get-server-port', () => SERVER_PORT);
 
+// Fires once on startup if the internal Express server failed to bind.
+// Lets the renderer show a fatal banner instead of a perpetual spinner.
+ipcMain.on('app:report-fatal', (_event, payload) => {
+  console.error('[lsdm] renderer reports:', payload);
+  if (Notification.isSupported()) {
+    new Notification({
+      title: 'LSDM — fatal error',
+      body: payload?.message || 'Check the logs and restart LSDM.',
+    }).show();
+  }
+});
+
+// One-shot reply signal: the renderer probes this before declaring the UI
+// dead. If the server is up but the page is responding, we know it's a
+// renderer bug; if the server is down, it's a fatal Express/port issue.
+ipcMain.handle('app:health-check', async () => {
+  try {
+    const r = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/status`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    return { ok: r.ok, status: r.status };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+});
+
 ipcMain.on('download:trigger-prompt', (event, url) => {
   createDownloadPrompt(url);
 });
@@ -310,23 +476,130 @@ ipcMain.on('prompt:close', () => {
   if (promptWindow) promptWindow.close();
 });
 
+// macOS traditionally keeps the app alive after the last window is closed
+// (just hides the dock icon). On Windows/Linux the expectation is to fully
+// quit. Without an explicit window-all-closed handler, the standard
+// Electron default is to quit on non-darwin platforms — that's already
+// correct, but it skips ORCHESTRATING our exit when the user closes the
+// last window via the X. We honour app.isQuitting and route through the
+// existing before-quit shutdown path so the aria2 session gets saved
+// even on a 'window-X' quit.
+app.on('window-all-closed', () => {
+  if (process.platform === 'darwin') return;
+  // Trigger our before-quit handler so aria2's session is saved before
+  // the process dies. app.quit() chains into before-quit which honours
+  // the isQuitting flag, so calling it directly is safe.
+  if (!app.isQuitting) {
+    app.isQuitting = true;
+    app.quit();
+  }
+});
+
+// On macOS, when the dock icon is clicked with no windows open, recreate
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createMainWindow();
+  } else if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    if (!mainWindow.isVisible()) mainWindow.show();
+    mainWindow.focus();
+  }
+});
+
 app.whenReady().then(() => {
   startAriaDaemon();
   createMainWindow();
-  try { createTray(); } catch (e) {}
+  // Don't swallow tray creation errors. Tray APIs can fail when there's no
+  // notification area visible (e.g. RDP without a taskbar, or a policy
+  // block); surfacing the failure lets the user diagnose instead of wondering
+  // why "Exit" is suddenly missing.
+  try {
+    createTray();
+  } catch (err) {
+    console.warn('[lsdm] tray creation failed (continuing without tray):', err?.message || err);
+    if (Notification.isSupported()) {
+      new Notification({
+        title: 'LSDM',
+        body: 'System tray unavailable — the app is running but you must use the window to control it.',
+      }).show();
+    }
+  }
   startClipboardWatcher();
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
-    else mainWindow.show();
-  });
+  // Note: 'activate' is registered above (module-level) so we don't
+  // duplicate it here.
 });
 
-app.on('before-quit', () => {
+// Best-effort graceful shutdown helper. Saves the aria2 session (so an
+// aria2c restart can resume every unfinished download), then sends SIGTERM
+// via aria2.shutdown and waits up to 5s. Falls back to SIGKILL only if the
+// daemon ignores the request — this used to be the only path, which meant
+// SIGKILL'd aria2 had no chance to flush state.
+async function shutdownAriaDaemon() {
+  if (!ariaProcess) return;
+  const secret = process.env.ARIA2_SECRET;
+  if (secret) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 1500);
+      const r1 = await fetch('http://127.0.0.1:6800/jsonrpc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'lsdm-save',
+          method: 'aria2.saveSession',
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      void r1; // result isn't actionable — saveSession returns "OK"
+    } catch (err) {
+      console.warn('[lsdm] aria2.saveSession failed:', err.message);
+    }
+    try {
+      const ctrl2 = new AbortController();
+      const timer2 = setTimeout(() => ctrl2.abort(), 2000);
+      const r2 = await fetch('http://127.0.0.1:6800/jsonrpc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'lsdm-shutdown',
+          method: 'aria2.shutdown',
+        }),
+        signal: ctrl2.signal,
+      });
+      clearTimeout(timer2);
+      void r2;
+    } catch (err) {
+      console.warn('[lsdm] aria2.shutdown RPC failed (will SIGKILL):', err.message);
+    }
+  }
+  // Wait up to 5s for aria2 to actually exit cleanly; SIGKILL otherwise.
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    ariaProcess.once('exit', finish);
+    const fallback = setTimeout(() => {
+      try { ariaProcess.kill('SIGKILL'); } catch {}
+      finish();
+    }, 5000);
+    ariaProcess.once('exit', () => clearTimeout(fallback));
+  });
+}
+
+app.on('before-quit', async (event) => {
+  if (app.isQuitting) return; // re-entrancy guard
   app.isQuitting = true;
   // Stop the clipboard sniffer so it can't fire a prompt mid-shutdown
   if (clipboardWatcher) clearInterval(clipboardWatcher);
+  // Block quit until aria2 saved its session. The handler is async but
+  // Electron only waits for it if we register on will-quit too — so we
+  // also keep a fallback SIGKILL timer in case the RPC hangs.
   if (ariaProcess) {
-    ariaProcess.kill();
+    event.preventDefault();
+    shutdownAriaDaemon()
+      .catch((e) => console.warn('[lsdm] shutdownAriaDaemon error:', e?.message || e))
+      .finally(() => app.exit(0));
   }
 });

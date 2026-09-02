@@ -17,13 +17,14 @@ const btnSaveSettings = document.getElementById("btn-save-settings");
 function formatBytes(bytes) {
   if (!bytes && bytes !== 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0,
-    v = bytes;
+  let i = 0, v = Math.abs(bytes);
   while (v >= 1024 && i < units.length - 1) {
     v /= 1024;
     i++;
   }
-  return `${v.toFixed(1)} ${units[i]}`;
+  // Two decimals for sub-10 values (precise), one decimal otherwise (clean).
+  const dp = v < 10 ? 2 : v < 100 ? 1 : 0;
+  return `${v.toFixed(dp)} ${units[i]}`;
 }
 
 function esc(s) {
@@ -37,9 +38,22 @@ function esc(s) {
 }
 
 // 1. WebSocket Live Stream
+// Reconnect strategy: exponential backoff with jitter, capped so that a
+// stuck server doesn't produce a barrage of timing-aligned retries (the
+// classic dog-pile). After enough failures we also fire a fatal report to
+// the main process so the user gets a notification + clear UI banner.
+let wsBackoffMs = 0;
+let wsFailureStreak = 0;
 function connectWebSocket() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+  let opened = false;
+  ws.onopen = () => {
+    opened = true;
+    wsBackoffMs = 0;
+    wsFailureStreak = 0;
+  };
 
   ws.onmessage = (event) => {
     try {
@@ -53,9 +67,34 @@ function connectWebSocket() {
     }
   };
 
-  ws.onclose = () => setTimeout(connectWebSocket, 1500);
+  ws.onclose = () => {
+    if (opened) wsFailureStreak = 0;
+    else wsFailureStreak++;
+    // Exponential backoff: 1s, 2s, 4s, … up to 15s, plus +/- 500ms jitter so
+    // a herd of clients doesn't all retry on the same tick.
+    const base = Math.min(15000, 1000 * 2 ** Math.min(wsFailureStreak, 4));
+    const delay = base + Math.floor(Math.random() * 1000) - 500;
+    renderServerHealth(delay);
+    if (wsFailureStreak >= 5) {
+      // Loud: tell main, show the user a banner, keep trying in background.
+      window.electronAPI?.reportFatal?.(
+        `Local server not responding after ${wsFailureStreak} attempts. Check the aria2 daemon and main process logs.`,
+      );
+      document.body.dataset.serverDown = "true";
+    }
+    setTimeout(connectWebSocket, Math.max(500, delay));
+  };
+
+  ws.onerror = () => {
+    // onclose fires immediately after; nothing else to do here
+  };
 }
 connectWebSocket();
+
+function renderServerHealth(_retryIn) {
+  // Hook used by future fatal banner. Kept as a no-op for now since the
+  // .serverDown attribute on <body> already drives styling.
+}
 
 // 2. Tab Navigation
 document.querySelectorAll(".sidebar .nav-item").forEach((btn) => {
@@ -129,17 +168,118 @@ btnSaveSettings?.addEventListener("click", async () => {
 document
   .getElementById("win-min")
   ?.addEventListener("click", () => window.electronAPI?.minimizeWindow?.());
-document
-  .getElementById("win-max")
-  ?.addEventListener("click", () => window.electronAPI?.maximizeWindow?.());
+
+// Maximize glyph toggle: ▢ when windowed, ❐ when full-screen. Driven by
+// the IPC event so OS-driven maximizes (Win+Up arrow, drag-to-top) sync up
+// too — the renderer-only click was bound to the wrong glyph before.
+const maxBtn = document.getElementById("win-max");
+function setMaxGlyph(isMaximized) {
+  if (!maxBtn) return;
+  maxBtn.textContent = isMaximized ? "\u274F" : "\u25A2";
+  maxBtn.title = isMaximized ? "Restore" : "Maximize";
+  maxBtn.dataset.state = isMaximized ? "maximized" : "normal";
+}
+setMaxGlyph(false);
+maxBtn?.addEventListener("click", () => window.electronAPI?.maximizeWindow?.());
+window.electronAPI?.onMaximizedStateChanged?.((isMax) => setMaxGlyph(isMax));
+
 document
   .getElementById("win-close")
   ?.addEventListener("click", () => window.electronAPI?.closeWindow?.());
+
+// 4b. Toolbar batch actions (Resume All / Pause All / Clear Finished).
+// Each button POSTs to its batch endpoint and updates the global toolbar
+// stats on completion. Disabled while a request is in flight to prevent
+// double-fires when users spam-click.
+async function callBatch(endpoint, label, opts = {}) {
+  const baseIdMap = {
+    "btn-resume-all": "resume",
+    "btn-pause-all": "pause",
+    "btn-clear-completed": "clear-completed",
+  };
+  for (const [btnId, action] of Object.entries(baseIdMap)) {
+    if (endpoint.includes(action)) {
+      const btn = document.getElementById(btnId);
+      if (!btn) return;
+      const restore = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = `<span>⏳</span> ${label}…`;
+      try {
+        const r = await fetch(endpoint, { method: "POST" });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok || body.ok === false) {
+          alert(body.error || `${label} failed (HTTP ${r.status})`);
+        } else if (action === "clear-completed") {
+          // Forces an immediate re-render so the table clears before WS tick
+          tasksCache = (tasksCache || []).filter(
+            (t) =>
+              t.state !== "complete" &&
+              t.state !== "error" &&
+              t.state !== "failed" &&
+              t.state !== "cancelled",
+          );
+          render();
+        }
+      } catch (err) {
+        alert(`Network error: ${err.message}`);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = restore;
+      }
+      return;
+    }
+  }
+}
+
+document.getElementById("btn-resume-all")?.addEventListener("click", () =>
+  callBatch("/api/all/resume", "Resume All"),
+);
+document.getElementById("btn-pause-all")?.addEventListener("click", () =>
+  callBatch("/api/all/pause", "Pause All"),
+);
+document.getElementById("btn-clear-completed")?.addEventListener("click", () => {
+  // Clear Finished is destructive (drops rows from the list) — confirm only
+  // if there is actually something to clear, to avoid user fatigue.
+  const finished = tasksCache.filter(
+    (t) =>
+      t.state === "complete" ||
+      t.state === "error" ||
+      t.state === "failed" ||
+      t.state === "cancelled",
+  ).length;
+  if (finished === 0) {
+    alert("Nothing to clear — no finished or failed downloads.");
+    return;
+  }
+  if (!confirm(`Remove ${finished} finished/failed entries from the list? (Files on disk are kept)`)) {
+    return;
+  }
+  callBatch("/api/completed/clear", "Clear Finished");
+});
 
 // 5. Add Modal Handlers
 document.getElementById("btn-add-url")?.addEventListener("click", () => {
   addModal.classList.add("show");
   document.getElementById("modal-url").focus();
+});
+
+// Bonus: an explicit "Add from clipboard" button paths to the saved
+// download:trigger-prompt IPC. Currently we let main.js' clipboard sniffer
+// drive the prompt, but exposing a button is useful when the user has a
+// URL they want to send and the auto-sniff didn't catch it (e.g. unusual
+// extension).
+const btnClip = document.getElementById("btn-clipboard-add");
+btnClip?.addEventListener("click", async () => {
+  try {
+    const txt = await navigator.clipboard.readText();
+    if (!txt || !/^https?:\/\//i.test(txt) && !txt.startsWith("magnet:?")) {
+      alert("Clipboard doesn't contain a URL or magnet link.");
+      return;
+    }
+    window.electronAPI?.triggerPrompt?.(txt);
+  } catch (err) {
+    alert(`Could not read clipboard: ${err.message}`);
+  }
 });
 
 const closeModal = () => {
@@ -264,6 +404,10 @@ function buildRow(t) {
   const row = document.createElement("div");
   row.className = "task-row-item";
   row.dataset.taskId = t.id;
+  // data-overflow toggles the marquee animation. It's set in app.js by
+  // measuring the rendered widths against the wrapper width; here it's
+  // "unknown" so the first measurement pass can flip it cleanly.
+  row.dataset.overflowMeasured = "false";
   row.innerHTML = `
     <!-- Top Row -->
     <div class="card-top-line">
@@ -330,17 +474,18 @@ function render() {
   let totalSpeed = 0;
   let totalConnections = 0;
   let counts = { all: tasks.length, downloading: 0, completed: 0, torrents: 0 };
+  // "Live" = a task that's actively consuming bandwidth right now. Paused,
+  // errored, or completed tasks contribute 0 to the connections total so
+  // the toolbar stat reflects real system activity, not stale state.
+  const LIVE_STATES = new Set(["active", "downloading", "managed-by-aria2"]);
 
   tasks.forEach((t) => {
-    totalSpeed += t.speed || 0;
-    totalConnections += t.connections || 0;
+    // Only sum speed from live tasks so a paused-then-resumed torrent with
+    // a stale speed=0 entry doesn't drag the global meter down.
+    if (LIVE_STATES.has(t.state)) totalSpeed += t.speed || 0;
+    if (LIVE_STATES.has(t.state)) totalConnections += t.connections || 0;
     if (t.state === "complete" || t.progress >= 100) counts.completed++;
-    else if (
-      t.state === "active" ||
-      t.state === "downloading" ||
-      t.state === "managed-by-aria2"
-    )
-      counts.downloading++;
+    else if (LIVE_STATES.has(t.state)) counts.downloading++;
     if (
       t.isTorrent ||
       t.url?.startsWith("magnet:") ||
@@ -365,7 +510,7 @@ function render() {
     filtered = tasks.filter((t) => t.isTorrent || t.url?.startsWith("magnet:"));
   else if (currentCategory === "videos")
     filtered = tasks.filter((t) =>
-      /\.(mp4|mkv|ts|m3u8|webm)$/i.test(t.fileName),
+      /\.(mp4|mkv|ts|m3u8|webm)$/i.test(t.fileName) || t.isHls,
     );
   else if (currentCategory === "compressed")
     filtered = tasks.filter((t) => /\.(zip|rar|7z|tar|iso)$/i.test(t.fileName));
@@ -382,11 +527,14 @@ function render() {
   }
   // Glitch fix: when transitioning empty -> non-empty, the "No downloads"
   // placeholder div would remain stuck above the rows
-  tableBody.querySelectorAll("div[style]").forEach((el) => el.remove());
+  tableBody.querySelectorAll(".empty-state-placeholder").forEach((el) => el.remove());
 
   if (filtered.length === 0) {
     rowElements.clear();
-    tableBody.innerHTML = `<div style="text-align:center; padding:30px; color:#526080;">No downloads in this category.</div>`;
+    tableBody.insertAdjacentHTML(
+      "beforeend",
+      `<div class="empty-state-placeholder" style="text-align:center; padding:30px; color:#526080;">No downloads in this category.</div>`,
+    );
     return;
   }
 
@@ -413,9 +561,17 @@ function render() {
 
     // Patch fields in place — no innerHTML rebuild, no listener churn
     const nameText = `${t.isTorrent ? "🧲 " : t.isHls ? "🎬 " : ""}${displayName}`;
-    if (refs.marquee.textContent !== nameText) {
+    // fileNameRevision lets the server nudge the renderer when torrent
+    // metadata has resolved and the placeholder name should be replaced
+    // (and similarly when a server-supplied filename overrides our basename).
+    const rev = String(t.fileNameRevision ?? 0);
+    if (refs.marquee.textContent !== nameText || refs.row.dataset.nameRev !== rev) {
       refs.marquee.textContent = nameText;
       refs.wrapper.title = displayName;
+      refs.row.dataset.nameRev = rev;
+      // Invalidate the cached overflow measurement so the next render pass
+      // re-measures the new name against the wrapper.
+      refs.row.dataset.overflowMeasured = "false";
     }
 
     const badgeText = isError
@@ -494,6 +650,32 @@ function render() {
         "beforeend",
         `<button class="btn-action-icon danger btn-cancel-task" data-id="${t.id}" title="Cancel & Delete File">🗑</button>`,
       );
+    }
+  });
+
+  // Measure marquee overflow once per text/badge change. Browser can't
+  // measure inline widths synchronously inside the patch pass, so we
+  // schedule a single rAF that walks the dirty rows and sets the CSS
+  // shift variable. Anything already measured is skipped.
+  requestAnimationFrame(() => {
+    for (const t of filtered) {
+      const refs = rowElements.get(t.id);
+      if (!refs || refs.row.dataset.overflowMeasured === "true") continue;
+      const wrapperW = refs.wrapper.clientWidth;
+      const contentW = refs.marquee.scrollWidth;
+      const overflow = contentW > wrapperW + 4;
+      refs.wrapper.dataset.overflow = overflow ? "true" : "false";
+      if (overflow) {
+        // Stop a touch before the wrapper's right edge so the fade mask
+        // doesn't reveal the trailing characters.
+        refs.marquee.style.setProperty(
+          "--marquee-shift",
+          `${-(contentW - wrapperW) + 8}px`,
+        );
+      } else {
+        refs.marquee.style.setProperty("--marquee-shift", "0px");
+      }
+      refs.row.dataset.overflowMeasured = "true";
     }
   });
 }

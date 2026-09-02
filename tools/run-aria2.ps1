@@ -1,7 +1,9 @@
 # tools/run-aria2.ps1
 param(
   [string]$AriaPath = "",
-  [int]$RpcPort = 6800
+  [int]$RpcPort = 6800,
+  [int]$MaxRestarts = 20,
+  [int]$RestartDelaySeconds = 3
 )
 
 $ErrorActionPreference = 'Continue'
@@ -59,21 +61,57 @@ Write-Host "Log file:   $logPath"
 Write-Host ""
 
 $restartCount = 0
-while ($true) {
+$cancelled = $false
+
+# Ctrl+C handler — actually break out of the loop instead of letting the user
+# stare at a "Press Ctrl+C to cancel" message that lies.
+$cancelHandler = {
+  $script:cancelled = $true
+  Write-Host "`nSupervisor cancelled by user. Cleaning up aria2..." -ForegroundColor Yellow
+  try {
+    Get-Process -Name 'aria2c' -ErrorAction SilentlyContinue |
+      Where-Object { $_.Path -eq $AriaPath } |
+      ForEach-Object { Stop-Process -Id $_.Id -Force }
+  } catch {}
+  exit 130
+}
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $cancelHandler | Out-Null
+[Console]::TreatControlCAsInput = $false
+$origCancel = [Console]::CancelKeyPress
+[Console]::AddKeyPressHandler({
+  param($k, $key)
+  if ($key.Modifiers -band [ConsoleModifiers]::Control -and $key.KeyChar -eq [char]3) {
+    $script:cancelled = $true
+  }
+}) | Out-Null
+
+while ($restartCount -lt $MaxRestarts) {
+  if ($cancelled) { break }
   $restartCount++
   $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-  Write-Host "[$timestamp] Starting aria2 (attempt $restartCount)..."
+  Write-Host "[$timestamp] Starting aria2 (attempt $restartCount of $MaxRestarts)..."
 
   # Start directly with visible output on crash
   $proc = Start-Process -FilePath $AriaPath -ArgumentList $rpcArgs -WorkingDirectory $workingDir -PassThru -Wait -NoNewWindow
+
+  if ($cancelled) { break }
 
   $exitCode = $proc.ExitCode
   if ($exitCode -eq 0) {
     Write-Host "aria2 stopped normally." -ForegroundColor Yellow
     break
   }
-  
+
   Write-Host "aria2 exited with code $exitCode. Check log: $logPath" -ForegroundColor Red
-  Write-Host "Restarting in 3 seconds... (Press Ctrl+C to cancel)"
-  Start-Sleep -Seconds 3
+  Write-Host "Restarting in $RestartDelaySeconds seconds... (Press Ctrl+C to cancel)"
+  for ($i = 0; $i -lt $RestartDelaySeconds; $i++) {
+    if ($cancelled) { break }
+    Start-Sleep -Seconds 1
+  }
+}
+
+if ($restartCount -ge $MaxRestarts) {
+  Write-Host ""
+  Write-Host "Supervisor gave up after $MaxRestarts attempts." -ForegroundColor Red
+  Write-Host "Fix aria2 (see log: $logPath) and re-launch LSDM manually." -ForegroundColor Red
 }

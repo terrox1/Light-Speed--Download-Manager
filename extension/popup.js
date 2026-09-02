@@ -130,3 +130,7 @@ openMonitorButton.addEventListener('click', () => {
 
 updateServerStatus();
 setInterval(updateServerStatus, 5000);
+
+// Tell the background worker the user has seen the captures so it can
+// drop the persistent ↓ badge. Cheap idempotent signal.
+try { chrome.runtime.sendMessage({ type: 'POPUP_OPENED' }); } catch {}

@@ -82,6 +82,9 @@
         <button id="btn-add-url" class="tool-btn primary">
           <span>➕</span> Add URL / Torrent
         </button>
+        <button id="btn-clipboard-add" class="tool-btn" title="Read a URL from the clipboard and open the add-prompt window">
+          <span>📋</span> Paste
+        </button>
         <button id="btn-resume-all" class="tool-btn">
           <span>▶️</span> Resume All
         </button>
@@ -98,7 +101,7 @@
             <span class="stat-val speed" id="global-speed">0.0 MB/s</span>
           </div>
           <div class="stat-box">
-            <span class="stat-label">ACTIVE THREADS</span>
+            <span class="stat-label">LIVE THREADS</span>
             <span class="stat-val" id="global-threads">0</span>
           </div>
         </div>
@@ -137,7 +140,7 @@
 <section id="view-settings" class="tab-view">
   <div class="settings-card">
     <h2>Application & Storage Settings</h2>
-    
+
     <div class="setting-row">
       <div style="flex: 1;">
         <strong>Default Download Directory</strong>
@@ -184,7 +187,7 @@
       <h3>Add Download / Torrent</h3>
       <button id="modal-close" class="close-x" type="button" title="Close">&times;</button>
     </div>
-    
+
     <div class="modal-body">
       <label for="modal-url">URL or Magnet Link</label>
       <input id="modal-url" type="text" placeholder="https://example.com/file.zip or magnet:?xt=..." autocomplete="off" />

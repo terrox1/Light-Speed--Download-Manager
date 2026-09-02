@@ -5,14 +5,132 @@ const { WebSocketServer } = require("ws");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
+const { spawn } = require("child_process");
+// Available when running inside the Electron main process (packaged app only).
+// Guarded require so `node server.js` in dev still works without Electron.
+let electronApp = null;
+try { electronApp = require("electron").app; } catch {}
+
+// Standalone-mode guard: outside Electron we need to (a) spawn aria2 ourselves
+// so the user can run `node server.js` (or `npm run server`) and have it just
+// work, and (b) generate a random RPC secret instead of relying on the
+// Electron main to set ARIA2_SECRET. We only do this if aria2 isn't already
+// reachable on 6800 — if it's alive we just talk to it.
+const STANDALONE = !electronApp;
+if (STANDALONE) {
+  (async () => {
+    try {
+      const c = await Promise.race([
+        fetch("http://127.0.0.1:6800/jsonrpc", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0", id: "lsdm-boot", method: "aria2.getVersion",
+          }),
+          signal: AbortSignal.timeout(800),
+        }).then((r) => (r.ok ? true : Promise.reject(new Error("not aria2")))),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 900)),
+      ]);
+      console.log("[lsdm] aria2 already running on port 6800 \u2014 not respawning.");
+    } catch {
+      spawnAriaForStandalone();
+    }
+  })();
+}
+
+function spawnAriaForStandalone() {
+  const candidates = [
+    path.resolve(__dirname, "tools"),
+  ];
+  let ariaPath = null;
+  for (const dir of candidates) {
+    if (!fs.existsSync(dir)) continue;
+    const stack = [dir];
+    while (stack.length) {
+      const cur = stack.pop();
+      let entries = [];
+      try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch {}
+      for (const e of entries) {
+        const full = path.join(cur, e.name);
+        if (e.isDirectory()) stack.push(full);
+        else if (e.name.toLowerCase() === "aria2c.exe") { ariaPath = full; break; }
+      }
+      if (ariaPath) break;
+    }
+    if (ariaPath) break;
+  }
+  if (!ariaPath) {
+    console.warn("[lsdm] aria2c.exe not found in tools/ \u2014 downloads via aria2 will fail. Run tools/install-aria2.ps1 first.");
+    return;
+  }
+  const secret = crypto.randomBytes(16).toString("hex");
+  process.env.ARIA2_SECRET = secret;
+  const ariaDir = path.dirname(ariaPath);
+  const sessionPath = path.join(ariaDir, "aria2.session");
+  const proc = spawn(ariaPath, [
+    "--enable-rpc=true",
+    "--rpc-listen-all=false",
+    "--rpc-allow-origin-all=true",
+    "--rpc-listen-port=6800",
+    "--max-concurrent-downloads=16",
+    "--save-session=" + sessionPath,
+    "--save-session-interval=30",
+    "--bt-max-peers=200",
+    "--seed-time=0",
+    `--rpc-secret=${secret}`,
+  ], { cwd: ariaDir, windowsHide: true, stdio: "ignore" });
+  proc.on("exit", (code) => console.warn(`[lsdm] aria2 exited (code ${code}); restart it manually.`));
+  console.log("[lsdm] spawned standalone aria2 at", ariaPath);
+}
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 const port = process.env.PORT || 3000;
-const appRoot = process.pkg ? path.dirname(process.execPath) : __dirname;
+// Packaging-aware paths: inside an electron-builder asar archive __dirname is
+// read-only (app.asar/...). Downloads, config.json and logs MUST live in the
+// per-user appData dir instead. In dev (or plain `node server.js`) keep using
+// the project folder as before.
+// Priority order for fallback when Electron is silent/unavailable:
+//   1. userData via electronApp.getPath('userData')      (packaged w/ Electron)
+//   2. %LOCALAPPDATA%\LSDM                                (Windows per-user)
+//   3. %APPDATA%\LSDM                                     (roaming profile)
+//   4. os.tmpdir()/LSDM                                   (last-resort, always writable)
+function resolveWritableAppRoot() {
+  if (process.defaultApp || !__dirname.includes("app.asar")) return __dirname;
+  try {
+    return electronApp.getPath("userData");
+  } catch {}
+  const candidates = [
+    process.env.LOCALAPPDATA,
+    process.env.APPDATA,
+  ].filter(Boolean);
+  for (const base of candidates) {
+    const dir = path.join(base, "LSDM");
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const probe = path.join(dir, ".lsdm-write-probe");
+      fs.writeFileSync(probe, "ok");
+      fs.unlinkSync(probe);
+      return dir;
+    } catch {}
+  }
+  // Always succeeds: os.tmpdir() is per-user and writable
+  const tmp = path.join(os.tmpdir(), "LSDM");
+  try { fs.mkdirSync(tmp, { recursive: true }); } catch {}
+  return tmp;
+}
+const appRoot = resolveWritableAppRoot();
+if (!appRoot) {
+  // This branch is unreachable (os.tmpdir is always writable), but the
+  // early-exit keeps the linter happy and protects against future refactors
+  // that remove a fallback tier without updating tests.
+  console.error("[LSDM] FATAL: could not resolve a writable app root");
+  process.exit(1);
+}
 const configPath = path.resolve(appRoot, "config.json");
 
 // Load or initialize settings
@@ -20,8 +138,12 @@ let appConfig = {
   downloadDir: path.resolve(appRoot, "downloads"),
   defaultSplit: 16,
   diskCache: "128M",
+  // Per-host throttle. Home users with one or two real servers typically
+  // hit residential NAT limits at ~256 concurrent sockets; this lets them
+  // set a ceiling per hostname so a single slow host can't starve everything
+  // else. Maps hostname -> integer (1..64). Empty by default.
+  perHostMaxConnections: {},
 };
-
 if (fs.existsSync(configPath)) {
   try {
     Object.assign(appConfig, JSON.parse(fs.readFileSync(configPath, "utf8")));
@@ -30,7 +152,11 @@ if (fs.existsSync(configPath)) {
 if (!fs.existsSync(appConfig.downloadDir))
   fs.mkdirSync(appConfig.downloadDir, { recursive: true });
 
-let tasks = {};
+// Map preserves insertion order, has faster iteration for the polling loop,
+// and avoids the V8 polymorphic-hashmap penalty when we add/remove many keys.
+// The WebSocket payload still emits a plain object array — Map.values()
+// produces an iterator we spread into an array on broadcast.
+const tasks = new Map();
 
 app.use(express.json({ limit: "50mb" }));
 app.use((req, res, next) => {
@@ -48,7 +174,7 @@ app.get("/", (req, res) =>
 app.get("/ariang", (req, res) =>
   res.sendFile(path.join(__dirname, "public", "ariang.html")),
 );
-app.get("/api/status", (req, res) => res.json(Object.values(tasks)));
+app.get("/api/status", (req, res) => res.json([...tasks.values()]));
 
 // ---- Aria2 Monitor API (used by /ariang page & extension popup) ----
 app.get("/api/aria2/status", async (req, res) => {
@@ -81,7 +207,7 @@ app.post("/api/aria2/:gid/pause", async (req, res) => {
     return res
       .status(502)
       .json({ ok: false, error: resp?.error?.message || "aria2 RPC failed" });
-  for (const t of Object.values(tasks)) {
+  for (const t of tasks.values()) {
     if (t.aria2?.gid === req.params.gid) {
       t.state = "paused";
       t.speed = 0;
@@ -97,7 +223,7 @@ app.post("/api/aria2/:gid/resume", async (req, res) => {
     return res
       .status(502)
       .json({ ok: false, error: resp?.error?.message || "aria2 RPC failed" });
-  for (const t of Object.values(tasks)) {
+  for (const t of tasks.values()) {
     if (t.aria2?.gid === req.params.gid) t.state = "downloading";
   }
   broadcastTasks();
@@ -114,7 +240,7 @@ app.post("/api/aria2/:gid/cancel", async (req, res) => {
   await aria2Request("aria2.removeDownloadResult", [gid]);
 
   // Clean up partial files for the matching task
-  for (const [id, t] of Object.entries(tasks)) {
+  for (const [id, t] of tasks.entries()) {
     if (t.aria2?.gid === gid) {
       try {
         const files = await fsp.readdir(appConfig.downloadDir);
@@ -130,7 +256,7 @@ app.post("/api/aria2/:gid/cancel", async (req, res) => {
           }
         }
       } catch {}
-      delete tasks[id];
+      tasks.delete(id);
     }
   }
   broadcastTasks();
@@ -149,22 +275,35 @@ app.post("/api/aria2/:gid/options", async (req, res) => {
   if (Object.keys(opts).length === 0)
     return res.json({ ok: false, error: "No options provided" });
 
-  // changeUri trick: aria2 can only change some options on active downloads;
-  // split/max-conn require the download to be paused or applied to new tasks.
+  // aria2.changeOption succeeds for split/max-connection-per-server on
+  // ACTIVE downloads in aria2 >= 1.36. The pause/resume dance shown in older
+  // revisions was a stale workaround for 1.34 where some options rejected
+  // while running. Keeping the live path as the primary — only fall back to
+  // pause/change/resume when aria2 explicitly rejected the live change.
   const resp = await aria2Request("aria2.changeOption", [req.params.gid, opts]);
   if (!resp?.result) {
-    // Fallback: pause -> change -> resume so the new split takes effect
-    await aria2Request("aria2.forcePause", [req.params.gid]);
-    const resp2 = await aria2Request("aria2.changeOption", [
-      req.params.gid,
-      opts,
-    ]);
-    await aria2Request("aria2.unpause", [req.params.gid]);
-    if (!resp2?.result)
+    const errCode = String(resp?.error?.code ?? "");
+    // Aria2 returns errorCode=1 ("invalid option") when the option can't be
+    // applied to a live download — in that case flip pause -> change -> resume.
+    // Other errors (network, GID gone, etc.) are surfaced immediately.
+    if (errCode === "1") {
+      await aria2Request("aria2.forcePause", [req.params.gid]);
+      const resp2 = await aria2Request("aria2.changeOption", [
+        req.params.gid,
+        opts,
+      ]);
+      await aria2Request("aria2.unpause", [req.params.gid]);
+      if (!resp2?.result)
+        return res.json({
+          ok: false,
+          error: resp2?.error?.message || "Failed to update options",
+        });
+    } else {
       return res.json({
         ok: false,
-        error: resp2?.error?.message || "Failed to update options",
+        error: resp?.error?.message || "Failed to update options",
       });
+    }
   }
   res.json({ ok: true });
 });
@@ -172,7 +311,7 @@ app.post("/api/aria2/:gid/options", async (req, res) => {
 // Settings API
 app.get("/api/settings", (req, res) => res.json(appConfig));
 app.post("/api/settings", (req, res) => {
-  const { downloadDir, defaultSplit, diskCache } = req.body;
+  const { downloadDir, defaultSplit, diskCache, perHostMaxConnections } = req.body;
   try {
     if (downloadDir) {
       const resolved = path.resolve(String(downloadDir).trim());
@@ -198,6 +337,32 @@ app.post("/api/settings", (req, res) => {
       appConfig.defaultSplit = Math.round(n);
     }
     if (diskCache) appConfig.diskCache = String(diskCache);
+    if (perHostMaxConnections !== undefined) {
+      if (
+        perHostMaxConnections === null ||
+        typeof perHostMaxConnections !== "object" ||
+        Array.isArray(perHostMaxConnections)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "perHostMaxConnections must be an object: { 'host': 1..64 }",
+        });
+      }
+      const clean = {};
+      for (const [host, val] of Object.entries(perHostMaxConnections)) {
+        const norm = String(host).toLowerCase().trim();
+        if (!norm) continue;
+        const n = Number(val);
+        if (!Number.isFinite(n) || n < 1 || n > 64) {
+          return res.status(400).json({
+            ok: false,
+            error: `perHostMaxConnections['${host}'] must be between 1 and 64.`,
+          });
+        }
+        clean[norm] = Math.round(n);
+      }
+      appConfig.perHostMaxConnections = clean;
+    }
 
     fs.writeFileSync(configPath, JSON.stringify(appConfig, null, 2));
     res.json({ ok: true, config: appConfig });
@@ -269,21 +434,61 @@ function formatBytesSafe(bytes) {
   if (!bytes && bytes !== 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   let i = 0,
-    v = bytes;
+    v = Math.abs(bytes);
   while (v >= 1024 && i < units.length - 1) {
     v /= 1024;
     i++;
   }
-  return `${v.toFixed(1)} ${units[i]}`;
+  const dp = v < 10 ? 2 : v < 100 ? 1 : 0;
+  return `${v.toFixed(dp)} ${units[i]}`;
 }
 
+// Trim an arbitrary name to <= maxLen BYTES while never chopping a UTF-8
+// codepoint and always keeping the extension intact. Windows file paths
+// are counted in UTF-16 code units by most APIs, but fs.writeFile etc.
+// balk on invalid UTF-8 sequences — so we slice at a code-point boundary
+// on the byte buffer instead of the JS string.
+function trimToByteLenKeepExt(str, maxLen) {
+  // Reserve at least 200 bytes of effective length so anything reasonable
+  // gets through. The caller slices the buffer further if needed.
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= maxLen) return str;
+  const dot = str.lastIndexOf(".");
+  if (dot <= 0 || dot >= str.length - 1) {
+    // No usable extension; just chop at the largest valid UTF-8 prefix.
+    let end = maxLen;
+    while (end > 0 && (buf[end] & 0xc0) === 0x80) end--; // mid-codepoint guard
+    return buf.slice(0, end).toString("utf8");
+  }
+  const ext = str.slice(dot); // includes the dot
+  const stem = str.slice(0, dot);
+  const stemBuf = Buffer.from(stem, "utf8");
+  const extBuf = Buffer.from(ext, "utf8");
+  const budget = maxLen - extBuf.length;
+  if (budget <= 0) return str; // shouldn't happen for sane maxLen
+  let end = Math.min(stemBuf.length, budget);
+  while (end > 0 && (stemBuf[end] & 0xc0) === 0x80) end--;
+  return stemBuf.slice(0, end).toString("utf8") + ext;
+}
+
+// Windows reserves a handful of legacy 8.3 device names that can't be used
+// as filenames even with an extension: CON, PRN, AUX, NUL, COM1..COM9,
+// LPT1..LPT9. Detect & rewrite so we don't write into the void.
+const WINDOWS_RESERVED_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
 function sanitizeFileName(name) {
   if (!name) return "downloaded.file";
   let s = String(name)
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
-    .trim()
-    .replace(/\s+/g, " ");
-  return s.slice(0, 200) || "downloaded.file";
+    .replace(/[\s\u3000]+/g, " ")
+    // Leading/trailing dots and spaces are silently dropped by Windows on
+    // disk, which used to mean "movie.mp4" -> "mp4" and broke col integrity.
+    .replace(/^[.\s]+|[.\s]+$/g, "")
+    .trim();
+  if (WINDOWS_RESERVED_RE.test(s)) s = "_" + s; // Windows-renamed: "_CON.txt"
+  // Hard cap at 200 BYTES (NTFS allows 255, but we keep some headroom for
+  // aria2 suffixes that may append at the end). Slice by UTF-8 boundary.
+  s = trimToByteLenKeepExt(s, 200);
+  return s || "downloaded.file";
 }
 
 // Validate user-supplied download URLs. Returns { ok: true } or { ok: false, error }.
@@ -325,6 +530,31 @@ function validateDownloadUrl(rawUrl) {
   return { ok: true };
 }
 
+// HEAD probe cache. Some CDNs (Cloudflare-fronted, YouTube mirrors) answer
+// Range only the first time and then start returning cached headers that
+// say "no range support" indefinitely. Caching by hostname for 10 minutes
+// eliminates the per-new-download 8s hangs while still being responsive
+// to real config changes.
+const HEAD_PROBE_TTL_MS = 10 * 60 * 1000;
+const headProbeCache = new Map(); // hostname -> { acceptsBytes: bool, ts: number }
+function getCachedRangeSupport(hostname) {
+  const entry = headProbeCache.get(hostname);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > HEAD_PROBE_TTL_MS) {
+    headProbeCache.delete(hostname);
+    return null;
+  }
+  return entry.acceptsBytes;
+}
+function setCachedRangeSupport(hostname, acceptsBytes) {
+  headProbeCache.set(hostname, { acceptsBytes, ts: Date.now() });
+  // Cap the cache at 200 entries to prevent runaway memory.
+  if (headProbeCache.size > 200) {
+    const oldest = [...headProbeCache.entries()].sort((a, b) => a[1].ts - b[1].ts);
+    for (let i = 0; i < oldest.length - 200; i++) headProbeCache.delete(oldest[i][0]);
+  }
+}
+
 async function aria2Request(method, params = []) {
   try {
     // Prepend the RPC secret token when one is configured
@@ -361,7 +591,7 @@ app.post("/api/hls/download", async (req, res) => {
   const destPath = path.join(appConfig.downloadDir, safeName);
   const id = `hls-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-  tasks[id] = {
+  tasks.set(id, {
     id,
     url,
     fileName: safeName,
@@ -376,13 +606,19 @@ app.post("/api/hls/download", async (req, res) => {
     isHls: true,
     speed: 0,
     connections: 16,
-  };
+  });
+  // _cancelPromise resolves when the worker below has actually exited.
+  // The /cancel endpoint awaits this instead of guessing with a timer —
+  // the previous 500ms delay raced slow disks and unlinked files the worker
+  // was still writing to.
+  let cancelResolve;
+  tasks.get(id)._cancelPromise = new Promise((r) => { cancelResolve = r; });
 
   res.json({ id });
   broadcastTasks();
 
   (async () => {
-    const t = tasks[id];
+    const t = tasks.get(id);
     let fileHandle = null;
     let speedMeter = null;
 
@@ -510,9 +746,15 @@ app.post("/api/hls/download", async (req, res) => {
       let downloadedBytes = 0;
       let lastBytes = 0;
 
+      // speedMeter reports a 1-second delta. t.speed is the canonical UI
+      // field (legacy wiring); t.intervalBytes is the raw delta exposed for
+      // callers (like /ariang) that want to compute their own EMA without
+      // dragging in the rest of the websocket payload.
       speedMeter = setInterval(() => {
-        t.speed = downloadedBytes - lastBytes;
+        const intervalBytes = downloadedBytes - lastBytes;
         lastBytes = downloadedBytes;
+        t.intervalBytes = intervalBytes;
+        t.speed = intervalBytes;
         broadcastTasks();
       }, 1000);
 
@@ -567,13 +809,34 @@ app.post("/api/hls/download", async (req, res) => {
           const idx = currentIdx++;
           const segInfo = segmentUrls[idx];
 
-          // Retry failed segments up to 3 times instead of silently skipping
+          // Retry failed segments up to 3 times instead of silently skipping.
+          // Honors 429 / 503 Retry-After if the server sets it (CDNs do this),
+          // falling back to linear backoff otherwise.
           for (let attempt = 0; attempt < 3; attempt++) {
             try {
               const segRes = await fetch(segInfo.url, {
                 headers: requestHeaders,
               });
-              if (!segRes.ok) throw new Error(`HTTP ${segRes.status}`);
+              if (!segRes.ok) {
+                // Retry-After: <seconds> (RFC) or HTTP-date. Sessions that
+                // 429 us for too long naturally back off instead of slamming
+                // the CDN into a full block.
+                if ((segRes.status === 429 || segRes.status === 503) && attempt < 2) {
+                  const hdr = segRes.headers.get('retry-after');
+                  let waitMs = 500 * (attempt + 1);
+                  if (hdr) {
+                    const asInt = parseInt(hdr, 10);
+                    if (!Number.isNaN(asInt) && asInt >= 0 && asInt <= 60) waitMs = asInt * 1000;
+                    else {
+                      const asDate = Date.parse(hdr);
+                      if (!Number.isNaN(asDate)) waitMs = Math.max(500, asDate - Date.now());
+                    }
+                  }
+                  await new Promise((r) => setTimeout(r, waitMs));
+                  continue;
+                }
+                throw new Error(`HTTP ${segRes.status}`);
+              }
 
               let chunkBuf = Buffer.from(await segRes.arrayBuffer());
 
@@ -651,6 +914,10 @@ app.post("/api/hls/download", async (req, res) => {
       t.error = error.message;
       t.speed = 0;
       broadcastTasks();
+    } finally {
+      // Signal the /cancel endpoint that the worker is truly done so it can
+      // safely remove the task and its partial files.
+      try { cancelResolve?.(); } catch {}
     }
   })();
 });
@@ -891,7 +1158,7 @@ async function resolveGoogleDriveUrl(rawUrl, incomingCookie = null) {
 // Uses the cookie jar captured during resolution so Google never sees a
 // CookieMismatch. Parallel range requests for speed, streamed to disk.
 async function downloadGDriveFile(taskId, downloadUrl, cookie, fileName) {
-  const t = tasks[taskId];
+  const t = tasks.get(taskId);
   if (!t) return;
   const destPath = path.join(appConfig.downloadDir, fileName);
   let fileHandle = null;
@@ -902,13 +1169,19 @@ async function downloadGDriveFile(taskId, downloadUrl, cookie, fileName) {
     const reqHeaders = { ...defaultHeaders };
     if (cookie) reqHeaders.Cookie = cookie;
 
-    // Extract the REAL Drive file id from the download URL (query "id=") —
-    // the old code passed taskId ("gdrive-...") here, so when the interstitial
-    // form omitted a hidden id field the rebuilt URL carried garbage.
+    // Extract the REAL Drive file id from the download URL (query "id=").
+    // Critical: if the id is missing we must NOT fall back to taskId
+    // ("gdrive-1742…" garbage) — the old code did that and produced bogus
+    // confirm URLs that bounced to accounts.google.com. Fail loudly instead.
     let gdriveFileId = null;
     try {
       gdriveFileId = new URL(downloadUrl).searchParams.get("id") || null;
     } catch {}
+    if (!gdriveFileId) {
+      throw new Error(
+        "Google Drive returned a download URL with no file id. The link is expired or invalid — please copy a fresh share link.",
+      );
+    }
 
     // Guard against the virus-scan interstitial: if Google still answers with
     // an HTML page, parse its confirm form and rebuild the real download URL
@@ -925,7 +1198,10 @@ async function downloadGDriveFile(taskId, downloadUrl, cookie, fileName) {
           return url;
         }
         const html = await head.text();
-        const next = buildGDriveConfirmUrl(url, gdriveFileId || taskId, html);
+        // taskId intentionally dropped from this fallback chain — by the
+        // time we reach here the explicit !gdriveFileId throw above
+        // guarantees the id is present and valid.
+        const next = buildGDriveConfirmUrl(url, gdriveFileId, html);
         if (!next || next === url)
           throw new Error(
             "Google Drive returned an HTML page instead of the file (confirm token missing — link may be private or quota-limited).",
@@ -1102,7 +1378,7 @@ async function downloadGDriveFile(taskId, downloadUrl, cookie, fileName) {
 
     if (t.state === "cancelled") {
       await fsp.unlink(destPath).catch(() => {});
-      delete tasks[taskId];
+      tasks.delete(taskId);
     } else if (
       t.total &&
       downloadedBytes < Math.min(1024 * 1024, t.total * 0.01)
@@ -1183,7 +1459,8 @@ app.post("/api/download", async (req, res) => {
       fileName || gdrive.fileName || `gdrive_${Date.now()}.bin`,
     );
     const id = `gdrive-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    tasks[id] = {
+    let gdriveCancelResolve;
+    tasks.set(id, {
       id,
       url: rawUrl,
       fileName: safeName,
@@ -1198,10 +1475,12 @@ app.post("/api/download", async (req, res) => {
       isGDrive: true,
       speed: 0,
       connections: 1,
-    };
+      _cancelPromise: new Promise((r) => { gdriveCancelResolve = r; }),
+    });
     res.json({ id });
     broadcastTasks();
-    downloadGDriveFile(id, gdrive.url, gdriveCookie, safeName);
+    downloadGDriveFile(id, gdrive.url, gdriveCookie, safeName)
+      .finally(() => { try { gdriveCancelResolve?.(); } catch {} });
     return;
   }
 
@@ -1228,22 +1507,35 @@ app.post("/api/download", async (req, res) => {
   // all 16 "connections" collapse into ONE stream and splitting cannot
   // multiply the speed — worth surfacing in the UI instead of guessing.
   let rangeSupported = null;
+  let probeHost = null;
   try {
-    const probe = await fetch(rawUrl, {
-      method: "HEAD",
-      headers: { "User-Agent": norm["User-Agent"], Accept: "*/*" },
-      signal: AbortSignal.timeout(8000),
-      redirect: "follow",
-    });
-    const accepts = String(
-      probe.headers.get("accept-ranges") || "",
-    ).toLowerCase();
-    rangeSupported = probe.ok && accepts.includes("bytes");
+    probeHost = new URL(rawUrl).hostname;
+    const cached = probeHost ? getCachedRangeSupport(probeHost) : null;
+    if (cached !== null) {
+      rangeSupported = cached;
+    } else {
+      const probe = await fetch(rawUrl, {
+        method: "HEAD",
+        headers: {
+          "User-Agent": norm["User-Agent"],
+          Accept: "*/*",
+          "Cache-Control": "no-cache",
+          Pragma: "no-cache",
+        },
+        signal: AbortSignal.timeout(8000),
+        redirect: "follow",
+      });
+      const accepts = String(
+        probe.headers.get("accept-ranges") || "",
+      ).toLowerCase();
+      rangeSupported = probe.ok && accepts.includes("bytes");
+      if (probeHost) setCachedRangeSupport(probeHost, !!rangeSupported);
+    }
   } catch {
     rangeSupported = null;
   } // unknown — let aria2 try anyway
 
-  tasks[id] = {
+  tasks.set(id, {
     id,
     url: resolvedUrl,
     fileName: safeName,
@@ -1260,16 +1552,18 @@ app.post("/api/download", async (req, res) => {
     rangeSupported,
     speed: 0,
     connections: 0,
-  };
+  });
 
   // Anti-hotlink fix: many CDNs (vidssave, streamtape, googlevideo mirrors...)
   // answer plain aria2 requests with HTTP 403 unless the request carries a
   // plausible browser fingerprint. When the caller didn't supply one, derive
   // Referer/Origin from the download URL itself so the host sees its own site.
+  let taskHostname = null;
   try {
     const u = new URL(resolvedUrl);
     if (!norm["Referer"]) norm["Referer"] = `${u.protocol}//${u.host}/`;
     if (!norm["Origin"]) norm["Origin"] = `${u.protocol}//${u.host}`;
+    taskHostname = u.hostname.toLowerCase();
   } catch {}
 
   const headerArr = [];
@@ -1318,9 +1612,17 @@ app.post("/api/download", async (req, res) => {
     opts.out = safeName;
     const effSplit = Math.min(16, Number(split) || 16);
     opts.split = String(effSplit);
-    opts["max-connection-per-server"] = String(
-      Math.min(16, Number(maxConnectionPerServer) || 16),
-    );
+    // Apply the per-host connection cap (if configured) on top of the requested
+    // value, taking the smaller of the two. The intent is to let a user clamp
+    // a known slow host without losing speed for other hosts.
+    const requested = Math.min(16, Number(maxConnectionPerServer) || 16);
+    const hostCap = taskHostname
+      ? appConfig.perHostMaxConnections?.[taskHostname]
+      : undefined;
+    const effMaxConn = hostCap
+      ? Math.min(requested, hostCap)
+      : requested;
+    opts["max-connection-per-server"] = String(effMaxConn);
     opts["min-split-size"] = "1M"; // Smaller chunks = better parallel utilization
     opts["piece-length"] = "1M"; // Match min-split-size for finer parallelism
     opts["socket-recv-buffer-size"] = "4M";
@@ -1344,16 +1646,28 @@ app.post("/api/download", async (req, res) => {
   if (isMagnet) {
     opts["allow-overwrite"] = "true";
     opts["auto-file-renaming"] = "false";
+    // Allow the prompt to tune bt-max-peers (50..200) per task; the renderer
+    // validates that range, but we clamp again defensively.
+    const peers = Number(maxConnectionPerServer) || Number(split) || 150;
+    if (Number.isFinite(peers) && peers >= 1 && peers <= 500) {
+      opts["bt-max-peers"] = String(Math.round(peers));
+    }
   }
 
   const ariaResult = await aria2Request("aria2.addUri", [[resolvedUrl], opts]);
   if (ariaResult?.result) {
-    tasks[id].aria2 = { gid: ariaResult.result };
-    tasks[id].options = opts; // Exposed for the /ariang monitor page
-    tasks[id].state = "managed-by-aria2";
+    const entry = tasks.get(id);
+    if (entry) {
+      entry.aria2 = { gid: ariaResult.result };
+      entry.options = opts; // Exposed for the /ariang monitor page
+      entry.state = "managed-by-aria2";
+    }
   } else {
-    tasks[id].state = "failed";
-    tasks[id].error = ariaResult?.error?.message || "Failed to start in engine";
+    const entry = tasks.get(id);
+    if (entry) {
+      entry.state = "failed";
+      entry.error = ariaResult?.error?.message || "Failed to start in engine";
+    }
   }
 
   broadcastTasks();
@@ -1369,7 +1683,7 @@ app.post("/api/torrent", async (req, res) => {
   const id = `task-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
   const safeName = sanitizeFileName(fileName || "Torrent Package");
 
-  tasks[id] = {
+  tasks.set(id, {
     id,
     url: "file.torrent",
     fileName: safeName,
@@ -1383,7 +1697,7 @@ app.post("/api/torrent", async (req, res) => {
     backend: "aria2",
     speed: 0,
     connections: 0,
-  };
+  });
 
   // In server.js inside app.post('/api/download') and app.post('/api/torrent')
   const opts = {
@@ -1415,11 +1729,17 @@ app.post("/api/torrent", async (req, res) => {
     opts,
   ]);
   if (ariaResult?.result) {
-    tasks[id].aria2 = { gid: ariaResult.result };
-    tasks[id].state = "managed-by-aria2";
+    const entry = tasks.get(id);
+    if (entry) {
+      entry.aria2 = { gid: ariaResult.result };
+      entry.state = "managed-by-aria2";
+    }
   } else {
-    tasks[id].state = "failed";
-    tasks[id].error = ariaResult?.error?.message || "Invalid .torrent file";
+    const entry = tasks.get(id);
+    if (entry) {
+      entry.state = "failed";
+      entry.error = ariaResult?.error?.message || "Invalid .torrent file";
+    }
   }
 
   broadcastTasks();
@@ -1428,7 +1748,7 @@ app.post("/api/torrent", async (req, res) => {
 
 // 3. Task Action Controls (Pause / Resume / Cancel + Hard File Cleanup)
 app.post("/api/task/:id/pause", async (req, res) => {
-  const t = tasks[req.params.id];
+  const t = tasks.get(req.params.id);
   if (!t) return res.json({ ok: false });
 
   if (t.isHls || t.isGDrive) {
@@ -1446,7 +1766,7 @@ app.post("/api/task/:id/pause", async (req, res) => {
 
 // In server.js replace app.post('/api/task/:id/resume') with:
 app.post("/api/task/:id/resume", async (req, res) => {
-  const t = tasks[req.params.id];
+  const t = tasks.get(req.params.id);
   if (!t) return res.json({ ok: false });
 
   if (t.isHls || t.isGDrive) {
@@ -1490,9 +1810,100 @@ app.post("/api/task/:id/resume", async (req, res) => {
   broadcastTasks();
   res.json({ ok: true });
 });
+// Bulk actions: pause / resume / clear-completed — used by the toolbar buttons
+// that the main UI exposes but the server never wired up.
+async function bulkSend(action) {
+  const out = { ok: 0, skipped: 0, failed: 0 };
+  for (const t of tasks.values()) {
+    try {
+      if (action === "pause") {
+        if (t.isHls || t.isGDrive) {
+          // Workers self-poll t.state, just flip the flag
+          if (t.state === "downloading" || t.state === "active" || t.state === "managed-by-aria2") {
+            t.state = "paused";
+            t.speed = 0;
+            out.ok++;
+          } else out.skipped++;
+        } else if (t.aria2?.gid) {
+          await aria2Request("aria2.pause", [t.aria2.gid]);
+          t.state = "paused";
+          t.speed = 0;
+          out.ok++;
+        } else out.skipped++;
+      } else if (action === "resume") {
+        if (t.isHls || t.isGDrive) {
+          if (t.state === "paused") {
+            t.state = "downloading";
+            out.ok++;
+          } else out.skipped++;
+        } else if (t.state === "error" || t.state === "failed") {
+          // Re-queue with same options as the per-task resume path
+          const safeName = t.fileName || "downloaded.file";
+          const opts = {
+            ...(t.options || {}),
+            dir: appConfig.downloadDir,
+            out: safeName,
+            "allow-overwrite": "true",
+            continue: "true",
+            split: String(t.split || 16),
+            "max-connection-per-server": String(t.maxConnectionPerServer || 16),
+            "min-split-size": "1M",
+            "socket-recv-buffer-size": "4M",
+            "disk-cache": appConfig.diskCache,
+            "lowest-speed-limit": "0",
+            "max-tries": "8",
+            "retry-wait": "1",
+            "auto-file-renaming": "false",
+          };
+          const ariaResult = await aria2Request("aria2.addUri", [[t.url], opts]);
+          if (ariaResult?.result) {
+            t.aria2 = { gid: ariaResult.result };
+            t.state = "managed-by-aria2";
+            t.error = null;
+            out.ok++;
+          } else out.failed++;
+        } else if (t.aria2?.gid) {
+          await aria2Request("aria2.unpause", [t.aria2.gid]);
+          t.state = "downloading";
+          out.ok++;
+        } else out.skipped++;
+      }
+    } catch {
+      out.failed++;
+    }
+  }
+  broadcastTasks();
+  return out;
+}
+
+app.post("/api/all/pause", async (_req, res) => {
+  res.json(await bulkSend("pause"));
+});
+app.post("/api/all/resume", async (_req, res) => {
+  res.json(await bulkSend("resume"));
+});
+// "Clear finished" — drop completed/error/cancelled tasks from the list but
+// never touch files on disk; the user explicitly opted in via the toolbar.
+app.post("/api/completed/clear", async (_req, res) => {
+  let removed = 0;
+  for (const [id, t] of tasks.entries()) {
+    if (
+      t.state === "complete" ||
+      t.state === "error" ||
+      t.state === "failed" ||
+      t.state === "cancelled"
+    ) {
+      tasks.delete(id);
+      removed++;
+    }
+  }
+  broadcastTasks();
+  res.json({ ok: true, removed });
+});
+
 app.post("/api/task/:id/cancel", async (req, res) => {
   const id = req.params.id;
-  const t = tasks[id];
+  const t = tasks.get(id);
   if (!t) return res.json({ ok: true });
 
   const gid = t.aria2?.gid;
@@ -1506,8 +1917,14 @@ app.post("/api/task/:id/cancel", async (req, res) => {
   // they kept downloading in the background and raced the unlink below.
   if (t.isHls || t.isGDrive) {
     t.state = "cancelled";
-    // Give the workers a tick to observe the state before removing the task
-    await new Promise((r) => setTimeout(r, 500));
+    // Wait for the worker to truly exit instead of guessing with a timer.
+    // Capped at 5s so a stuck fetch can't stall the cancel UI forever.
+    if (t._cancelPromise) {
+      await Promise.race([
+        t._cancelPromise,
+        new Promise((r) => setTimeout(r, 5000)),
+      ]);
+    }
   }
 
   // Delete incomplete / partial files from disk
@@ -1523,7 +1940,7 @@ app.post("/api/task/:id/cancel", async (req, res) => {
   } catch {}
 
   // Remove completely from task list
-  delete tasks[id];
+  tasks.delete(id);
   broadcastTasks();
   res.json({ ok: true });
 });
@@ -1532,7 +1949,7 @@ app.post("/api/task/:id/cancel", async (req, res) => {
 function broadcastTasks() {
   const data = JSON.stringify({
     type: "TASKS_UPDATE",
-    tasks: Object.values(tasks),
+    tasks: [...tasks.values()],
   });
   wss.clients.forEach((c) => {
     if (c.readyState === 1) c.send(data);
@@ -1541,13 +1958,89 @@ function broadcastTasks() {
 
 wss.on("connection", (ws) => {
   ws.send(
-    JSON.stringify({ type: "TASKS_UPDATE", tasks: Object.values(tasks) }),
+    JSON.stringify({ type: "TASKS_UPDATE", tasks: [...tasks.values()] }),
   );
 });
 
+// Reconciliation: when LSDM restarts, in-memory `tasks` is empty even though
+// aria2 auto-resumed everything from --save-session. Without this, the user
+// sees "0 downloads" while aria2 is happily chewing through 4GB. We pull the
+// active aria2 task list on boot, attach a `tasks` entry per recovered GID,
+// and let the normal polling loop fill in live stats.
+async function syncTasksFromAria2BootOnce() {
+  try {
+    // aria2 returns active+waiting+done. We only care about non-terminal
+    // ones; anything in the "removed" list gets reaped on the next GC pass.
+    const resp = await aria2Request("aria2.getGlobalStat");
+    if (!resp?.result) return;
+    const numActive = Number(resp.result.numActive) || 0;
+    const numWaiting = Number(resp.result.numWaiting) || 0;
+    const total = numActive + numWaiting;
+    if (total === 0) return;
+    // aria2.tellActive + aria2.tellWaiting (num=1000 means up to 1000 rows) so we
+    // enumerate the live tasks. We deliberately cap both fetches to 1000 rows
+    // because anything beyond that would already blow past our UI rendering
+    // budget anyway.
+    const [active, waiting] = await Promise.all([
+      aria2Request("aria2.tellActive", [
+        ["gid", "status", "totalLength", "completedLength", "downloadSpeed",
+         "connections", "bittorrent", "files", "numSeeders", "dir", "followedBy"],
+      ]),
+      aria2Request("aria2.tellWaiting", [
+        1000,
+        ["gid", "status", "totalLength", "completedLength", "downloadSpeed",
+         "connections", "bittorrent", "files", "numSeeders", "dir", "followedBy"],
+      ]),
+    ]);
+    for (const source of [active?.result || [], waiting?.result || []]) {
+      for (const s of source) {
+        const gid = s.gid;
+        if (!gid) continue;
+        // Skip if we've somehow already attached a record (shouldn't happen
+        // on a fresh boot, but defends against a double-call race).
+        if ([...tasks.values()].some((t) => t.aria2?.gid === gid)) continue;
+        const firstFile = Array.isArray(s.files) && s.files[0] && s.files[0].path
+          ? path.basename(s.files[0].path)
+          : "downloaded.file";
+        const safeName = sanitizeFileName(firstFile);
+        const id = `task-${gid}`;
+        tasks.set(id, {
+          id,
+          gid, // legacy alias; harmless and used by lookup helpers
+          url: s.bittorrent?.info?.name || firstFile,
+          fileName: s.bittorrent?.info?.name || safeName,
+          originalFileName: s.bittorrent?.info?.name || safeName,
+          state: s.status || "active",
+          progress: s.totalLength
+            ? Math.round((Number(s.completedLength) / Number(s.totalLength)) * 100)
+            : 0,
+          downloaded: Number(s.completedLength) || 0,
+          total: Number(s.totalLength) || null,
+          split: Number(s.connections) || 16,
+          category: s.bittorrent ? "Torrents" : "General",
+          isTorrent: !!s.bittorrent,
+          backend: "aria2",
+          aria2: { gid },
+          speed: Number(s.downloadSpeed) || 0,
+          connections: Number(s.connections) || 0,
+          seeders: Number(s.numSeeders) || 0,
+          // Mark as recovered so the UI can label it if it wants to.
+          recovered: true,
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("[lsdm] syncTasksFromAria2BootOnce failed:", err?.message || err);
+  }
+}
+
+// Wait briefly for aria2 to be reachable before the sync; avoids a race where
+// the server starts listening before main.js' spawn call has bound 6800.
+setTimeout(syncTasksFromAria2BootOnce, 600).unref();
+
 // 5. Active Task Monitor Loop
 setInterval(async () => {
-  const activeTasks = Object.values(tasks).filter((t) => t.aria2?.gid);
+  const activeTasks = [...tasks.values()].filter((t) => t.aria2?.gid);
   if (activeTasks.length === 0) return;
 
   // In server.js inside setInterval() polling loop:
@@ -1619,9 +2112,18 @@ setInterval(async () => {
       t.fileName = s.bittorrent.info.name;
       t.originalFileName = s.bittorrent.info.name;
       t.isTorrent = true;
+      // Renderer caches badge text against the previous name; bumping a
+      // monotonic counter lets the row invalidate its in-place patch and
+      // pick up the new file name on the next WebSocket tick.
+      t.fileNameRevision = (t.fileNameRevision ?? 0) + 1;
     } else if (Array.isArray(s.files) && s.files[0]?.path) {
       const resolved = path.basename(s.files[0].path);
-      if (resolved && resolved !== "download") t.fileName = resolved;
+      if (resolved && resolved !== "download") {
+        // Same revision tag for plain files (where the server-derived
+        // filename beats the URL basename unconditionally).
+        if (resolved !== t.fileName) t.fileNameRevision = (t.fileNameRevision ?? 0) + 1;
+        t.fileName = resolved;
+      }
     }
   }
 

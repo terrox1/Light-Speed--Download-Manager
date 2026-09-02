@@ -13,6 +13,49 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "electron": "^43.4.1"
+    "electron": "^43.4.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.lsdm.downloadmanager",
+    "productName": "LSDM",
+    "copyright": "Copyright © 2025 LSDM",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "server.js",
+      "preload.js",
+      "package.json",
+      "public/**/*",
+      "extension/**/*",
+      "tools/install-aria2.ps1",
+      "tools/aria2_latest.zip",
+      "tools/run-aria2.ps1"
+    ],
+    "asarUnpack": [
+      "tools/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "LSDM"
+    }
   }
 }

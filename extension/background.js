@@ -24,6 +24,11 @@ function saveMedia() {
 
 loadMedia();
 
+// MV3 service workers can be killed at any time and restarted from scratch.
+// A stale "↓" badge from an indefinitely-pending download would otherwise
+// stay on the toolbar icon forever. Clear it at the top of every cold start.
+chrome.action.setBadgeText({ text: '' }).catch(() => {});
+
 function formatBytes(bytes) {
   if (!bytes || bytes === 0) return 'Unknown Size';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -32,17 +37,41 @@ function formatBytes(bytes) {
   return `${v.toFixed(1)} ${units[i]}`;
 }
 
+// Cookie cache: per-host (URL origin) for 60s. Cookies rarely change but
+// chrome.cookies.getAll on every detected media request hammers Chrome's
+// cookie DB. Cached miss means just one fetch; hit = 0.
+const COOKIE_TTL_MS = 60 * 1000;
+const cookieCache = new Map(); // host -> { value, ts }
 async function getCookiesForUrl(url) {
-  return new Promise((resolve) => {
+  let host;
+  try { host = new URL(url).origin; } catch { return ''; }
+  const cached = cookieCache.get(host);
+  if (cached && Date.now() - cached.ts < COOKIE_TTL_MS) return cached.value;
+
+  const value = await new Promise((resolve) => {
     try {
-      chrome.cookies.getAll({ url }, (cookies) => {
+      chrome.cookies.getAll({ url: host }, (cookies) => {
+        // Distinguish "no cookies" from API failure via lastError — a silent
+        // empty string "no cookies" hides bugs (e.g. missing host permission).
+        if (chrome.runtime.lastError) {
+          console.warn('[LSDM] cookies.getAll failed:', chrome.runtime.lastError.message);
+          return resolve('');
+        }
         if (!cookies || cookies.length === 0) return resolve('');
         resolve(cookies.map(c => `${c.name}=${c.value}`).join('; '));
       });
-    } catch {
+    } catch (e) {
+      console.warn('[LSDM] cookies API threw:', e?.message || e);
       resolve('');
     }
   });
+  cookieCache.set(host, { value, ts: Date.now() });
+  // Cap the cache to avoid unbounded growth under heavy browsing.
+  if (cookieCache.size > 200) {
+    const oldest = [...cookieCache.entries()].sort((a, b) => a[1].ts - b[1].ts);
+    cookieCache.delete(oldest[0][0]);
+  }
+  return value;
 }
 
 function extractCleanFilename(rawUrl, headers = {}) {
@@ -241,6 +270,19 @@ chrome.storage.local.get('autoCapture').then(({ autoCapture }) => {
 // to LSDM (persisted in chrome.storage.local, survives worker restarts and
 // browser restarts) and skip duplicates.
 let sentUrls = new Map(); // url -> timestamp of last send
+let sentUrlsLoaded = false;
+let sentUrlsLoadPromise = null;
+
+// MUST be awaited before any onCreated dedup check: at browser startup Chrome
+// replays every interrupted download and fires onCreated IMMEDIATELY, before
+// async storage read finishes. Without this gate, sentUrls is still empty and
+// every replayed download spawns a duplicate LSDM task (the "825 gdrive_*.bin
+// fetch failed" storm).
+async function ensureSentUrlsLoaded() {
+  if (sentUrlsLoaded) return;
+  if (!sentUrlsLoadPromise) sentUrlsLoadPromise = loadSentUrls();
+  await sentUrlsLoadPromise;
+}
 
 async function loadSentUrls() {
   try {
@@ -254,15 +296,27 @@ async function loadSentUrls() {
       }
     }
   } catch {}
+  sentUrlsLoaded = true;
 }
 
 let saveSentTimer = null;
 function markSent(url) {
+  // CRITICAL: set the timestamp first so a size overflow below never drops
+  // a URL we just marked. A fresh click 5 seconds ago should never disappear
+  // because the cap was reached via a different tab.
   sentUrls.set(url, Date.now());
-  // Hard cap at 1000 entries (drop the oldest)
+  // Memory cap. Two-tier policy: a URL is only eligible for eviction if BOTH
+  // (a) it's older than 24h AND (b) we're above 1000 entries. This keeps
+  // recent activity for the 7-day dedup window while still bounding memory.
   if (sentUrls.size > 1000) {
-    const oldest = [...sentUrls.entries()].sort((a, b) => a[1] - b[1]).slice(0, sentUrls.size - 1000);
-    for (const [u] of oldest) sentUrls.delete(u);
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const droppable = [...sentUrls.entries()]
+      .filter(([, ts]) => ts < cutoff)
+      .sort((a, b) => a[1] - b[1]);
+    const overflow = sentUrls.size - 1000;
+    for (let i = 0; i < Math.min(overflow, droppable.length); i++) {
+      sentUrls.delete(droppable[i][0]);
+    }
   }
   clearTimeout(saveSentTimer);
   saveSentTimer = setTimeout(() => {
@@ -276,6 +330,9 @@ chrome.downloads.onCreated.addListener(async (downloadItem) => {
   if (!autoCaptureEnabled) return;
   const url = downloadItem?.finalUrl || downloadItem?.url;
   if (!url) return;
+
+  // Wait for the dedup history before checking anything — see ensureSentUrlsLoaded()
+  await ensureSentUrlsLoaded();
 
   // Never capture our own API traffic or non-http sources (blob:, data:, etc.)
   if (!/^https?:\/\//i.test(url)) return;
@@ -318,13 +375,27 @@ chrome.downloads.onCreated.addListener(async (downloadItem) => {
     // Remember this URL so startup re-downloads don't spawn LSDM tasks again
     markSent(url);
 
-    // Show a badge on the extension icon so the user knows capture happened
-    chrome.action.setBadgeText({ text: '↓' });
+    // Show a badge on the extension icon so the user knows capture happened.
+    // Counter-style: each pending add increments so the user sees N↓.
+    let pending = 0;
+    try {
+      const cur = await chrome.action.getBadgeText({});
+      pending = parseInt(cur, 10) || 0;
+    } catch {}
+    pending += 1;
+    chrome.action.setBadgeText({ text: pending > 9 ? '9+' : String(pending) });
     chrome.action.setBadgeBackgroundColor({ color: '#22e8ff' });
-    setTimeout(() => chrome.action.setBadgeText({ text: '' }), 3000);
+    // Cap at 8s so a long queue doesn't leave the badge stuck. Tested in
+    // MV3: the text clear is fire-and-forget even after worker eviction.
+    setTimeout(() => {
+      pending = Math.max(0, pending - 1);
+      chrome.action.setBadgeText({ text: pending > 0 ? (pending > 9 ? '9+' : String(pending)) : '' });
+    }, 8000);
   } catch {
     // LSDM offline — re-download natively as fallback so user never loses the file
     try { chrome.downloads.download({ url }); } catch {}
+  } finally {
+    markSent(url);
   }
 });
 
@@ -336,7 +407,13 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       sendResponse({ media: mediaStreams.get(tabId) || [] });
     });
     return true;
- // In extension/background.js -> update START_MEDIA_DOWNLOAD handler:
+    // Falling through to media-detected message handling below
+  } else if (req.type === 'POPUP_OPENED') {
+    // User explicitly opened the popup — they've seen the captures, so
+    // clear the badge so it doesn't keep nagging across sessions.
+    chrome.action.setBadgeText({ text: '' }).catch(() => {});
+    return false;
+  // In extension/background.js -> update START_MEDIA_DOWNLOAD handler:
   } else if (req.type === 'START_MEDIA_DOWNLOAD') {
     (async () => {
       const cookieStr = await getCookiesForUrl(req.url);

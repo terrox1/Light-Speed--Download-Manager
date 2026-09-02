@@ -499,16 +499,21 @@ body.app-window {
   font-weight: 700;
   color: #fff;
   white-space: nowrap;
+  /* The translation distance is set in JS via --marquee-shift so the
+     animation always matches the actual overflow amount regardless of
+     row width / badge size. See render() in app.js. */
+  --marquee-shift: 0px;
 }
 
-/* Marquee activates when name overflows container */
-.marquee-wrapper:hover .marquee-content {
+/* When the wrapper has data-overflow="true" and the user hovers, animate
+   to the JS-computed shift. Falls back to no animation if data-overflow is
+   "false", so short filenames don't jitter on hover. */
+.marquee-wrapper[data-overflow="true"]:hover .marquee-content {
   animation: marquee-scroll 10s linear infinite alternate;
 }
-
 @keyframes marquee-scroll {
-  0% { transform: translateX(0); }
-  100% { transform: translateX(calc(-100% + 400px)); }
+  from { transform: translateX(0); }
+  to   { transform: translateX(var(--marquee-shift, 0)); }
 }
 
 .task-badge-pill {
@@ -814,4 +819,28 @@ select.inline-input option {
 .empty-state .empty-icon {
   font-size: 2.2rem;
   opacity: 0.5;
+}
+
+/* --- Server-down banner --- Played by app.js when the WebSocket can't
+   connect after several attempts. Sticky so it's impossible to miss. */
+body[data-server-down="true"]::before {
+  content: "Local server unreachable — downloads paused. Check the LSDM window's tray menu or restart the app.";
+  position: fixed;
+  top: 34px;
+  left: 0;
+  right: 0;
+  z-index: 10000;
+  display: block;
+  background: rgba(255, 84, 112, 0.95);
+  color: #fff;
+  font-size: 0.82rem;
+  font-weight: 700;
+  padding: 9px 16px;
+  text-align: center;
+  box-shadow: 0 2px 18px rgba(0, 0, 0, 0.45);
+  animation: lsdm-banner-pulse 1.6s ease-in-out infinite alternate;
+}
+@keyframes lsdm-banner-pulse {
+  from { background: rgba(255, 84, 112, 0.85); }
+  to   { background: rgba(255, 84, 112, 1); }
 }
