@@ -556,30 +556,37 @@ function setCachedRangeSupport(hostname, acceptsBytes) {
 }
 
 async function aria2Request(method, params = []) {
-  try {
-    // Prepend the RPC secret token when one is configured
-    const secret = getAria2Secret();
-    const finalParams = secret ? [`token:${secret}`, ...params] : params;
-    const body = {
-      jsonrpc: "2.0",
-      id: `req-${Date.now()}`,
-      method,
-      params: finalParams,
-    };
+  // Electron starts the HTTP server and aria2 in parallel. Retry transient
+  // connection failures so a user can click Download immediately after launch.
+  const secret = getAria2Secret();
+  const finalParams = secret ? [`token:${secret}`, ...params] : params;
+  const body = {
+    jsonrpc: "2.0",
+    id: `req-${Date.now()}`,
+    method,
+    params: finalParams,
+  };
+  for (let attempt = 0; attempt < 4; attempt++) {
     const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 4000);
-    const resp = await fetch(aria2RpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    clearTimeout(t);
-    if (!resp.ok) return null;
-    return await resp.json();
-  } catch {
-    return null;
+    const timer = setTimeout(() => controller.abort(), 4000);
+    try {
+      const resp = await fetch(aria2RpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (resp.ok) return await resp.json();
+      // HTTP responses (including auth errors) are real responses; do not hide
+      // them behind retries. Only retry when aria2 is not listening yet.
+      return null;
+    } catch {
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  return null;
 }
 
 // In server.js -> Replace app.post('/api/hls/download') with this robust engine:
@@ -2145,9 +2152,9 @@ server.on("error", (err) => {
 
 server.listen(port, "127.0.0.1", () => {
   console.log(`LSDM Server running at http://127.0.0.1:${port}`);
-  if (!process.env.ARIA2_SECRET) {
+  if (!process.env.ARIA2_SECRET && !STANDALONE) {
     console.warn(
-      "[LSDM] ARIA2_SECRET is not set. This is fine when launched via the Electron main process (it sets the secret automatically), but if you are running `node server.js` directly, every aria2 RPC call will be rejected with an auth error. Start the aria2 daemon with --rpc-secret=<value> and export ARIA2_SECRET=<same-value> first.",
+      "[LSDM] ARIA2_SECRET is not set yet. Download requests will wait for Electron to start aria2.",
     );
   }
 });

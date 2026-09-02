@@ -31,9 +31,7 @@
       "package.json",
       "public/**/*",
       "extension/**/*",
-      "tools/install-aria2.ps1",
-      "tools/aria2_latest.zip",
-      "tools/run-aria2.ps1"
+      "tools/**/*"
     ],
     "asarUnpack": [
       "tools/**/*"

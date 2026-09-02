@@ -82,14 +82,13 @@ function startAriaDaemon() {
   }
 
   const ariaDir = path.dirname(ariaPath);
-  const logDir = path.join(ariaDir, 'logs');
-  if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
-  const logPath = path.join(logDir, 'aria2.log');
-  // Persistence: keep an aria2.session file next to the log so unfinished
-  // downloads are restored after a restart. The session is also rewritten
-  // every 30s by aria2 itself (--save-session-interval=30), but we also
-  // force a saveSession/shutdown RPC on graceful quit (below).
-  const sessionPath = path.join(ariaDir, 'aria2.session');
+  // `ariaDir` is app.asar.unpacked in production and may be under Program Files.
+  // Keep mutable aria2 state in Electron's per-user data directory instead.
+  const ariaStateDir = path.join(app.getPath('userData'), 'aria2');
+  fs.mkdirSync(ariaStateDir, { recursive: true });
+  const logPath = path.join(ariaStateDir, 'aria2.log');
+  // Persistence: unfinished downloads are restored from the writable state dir.
+  const sessionPath = path.join(ariaStateDir, 'aria2.session');
 
   // 100% verified, stable high-speed flags
 // In main.js -> inside startAriaDaemon()
@@ -132,7 +131,7 @@ const args = [
   // instead of slowly discovering the network on first run
   '--dht-entry-point=router.bittorrent.com:6881',
   '--dht-entry-point6=dht.transmissionbt.com:6881',
-  '--dht-file-path=' + path.join(ariaDir, 'dht.dat'),
+  '--dht-file-path=' + path.join(ariaStateDir, 'dht.dat'),
   // Resume support: aria2 reads this file at startup, restarts every task
   // that wasn't finished, and rewrites it every 30s. Combined with the
   // saveSession/shutdown RPC on graceful quit, no download is ever silently
@@ -548,6 +547,7 @@ async function shutdownAriaDaemon() {
           jsonrpc: '2.0',
           id: 'lsdm-save',
           method: 'aria2.saveSession',
+          params: [`token:${secret}`],
         }),
         signal: ctrl.signal,
       });
@@ -566,6 +566,7 @@ async function shutdownAriaDaemon() {
           jsonrpc: '2.0',
           id: 'lsdm-shutdown',
           method: 'aria2.shutdown',
+          params: [`token:${secret}`],
         }),
         signal: ctrl2.signal,
       });
