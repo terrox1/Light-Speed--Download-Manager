@@ -22,17 +22,20 @@ const STANDALONE = !electronApp;
 if (STANDALONE) {
   (async () => {
     try {
-      const c = await Promise.race([
-        fetch("http://127.0.0.1:6800/jsonrpc", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0", id: "lsdm-boot", method: "aria2.getVersion",
-          }),
-          signal: AbortSignal.timeout(800),
-        }).then((r) => (r.ok ? true : Promise.reject(new Error("not aria2")))),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 900)),
-      ]);
+      const response = await fetch("http://127.0.0.1:6800/jsonrpc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: "lsdm-boot", method: "aria2.getVersion",
+        }),
+        signal: AbortSignal.timeout(800),
+      });
+      const payload = await response.json().catch(() => null);
+      // A listening HTTP service is not necessarily healthy aria2. Require a
+      // successful JSON-RPC result so auth errors cannot suppress startup.
+      if (!response.ok || !payload?.result?.version) {
+        throw new Error("aria2 RPC health check failed");
+      }
       console.log("[lsdm] aria2 already running on port 6800 \u2014 not respawning.");
     } catch {
       spawnAriaForStandalone();
@@ -74,12 +77,12 @@ function spawnAriaForStandalone() {
     "--rpc-listen-all=false",
     "--rpc-allow-origin-all=true",
     "--rpc-listen-port=6800",
+    "--rpc-secret=" + secret,
     "--max-concurrent-downloads=16",
     "--save-session=" + sessionPath,
     "--save-session-interval=30",
     "--bt-max-peers=200",
     "--seed-time=0",
-    `--rpc-secret=${secret}`,
   ], { cwd: ariaDir, windowsHide: true, stdio: "ignore" });
   proc.on("exit", (code) => console.warn(`[lsdm] aria2 exited (code ${code}); restart it manually.`));
   console.log("[lsdm] spawned standalone aria2 at", ariaPath);
@@ -1605,7 +1608,7 @@ app.post("/api/download", async (req, res) => {
     "bt-enable-lpd": "true",
     "bt-max-peers": "150",
     // Torrent speed fix: hint the swarm speed so aria2 connects to more peers
-    "bt-request-peer-speed-limit": "10M",
+    "bt-request-peer-speed-limit": "0",
     "follow-torrent": "true",
     "bt-min-crypto-level": "plain",
     "bt-require-crypto": "false",
@@ -1713,11 +1716,19 @@ app.post("/api/torrent", async (req, res) => {
     "enable-dht": "true",
     "enable-peer-exchange": "true",
     "bt-enable-lpd": "true",
-    "bt-max-peers": "150",
-    // Speed fix: tell aria2 the whole swarm speed so it opens more connections.
-    // With '0' (auto), aria2 throttles peer discovery and shows peers but barely
-    // downloads from them on well-seeded torrents.
-    "bt-request-peer-speed-limit": "10M",
+    "bt-max-peers": "200",
+    // Do not force sequential piece selection: it prevents aria2 from using
+    // multiple peers concurrently and causes the stalled/very-low-speed state.
+    "force-sequential": "false",
+    // Do not impose a fabricated peer-speed threshold; slower peers are still
+    // useful and are often the only peers available in a sparse swarm.
+    "bt-tracker-connect-timeout": "10",
+    "bt-tracker-interval": "60",
+    "bt-enable-hook-after-hash-check": "true",
+    "max-overall-download-limit": "0",
+    "max-download-limit": "0",
+    // Leave the peer speed hint unset. A fabricated 10M value can make aria2
+    // overestimate the swarm and behave poorly on slow or private torrents.
     "bt-min-crypto-level": "plain",
     "bt-require-crypto": "false",
     "seed-time": "0",
@@ -1739,6 +1750,7 @@ app.post("/api/torrent", async (req, res) => {
     const entry = tasks.get(id);
     if (entry) {
       entry.aria2 = { gid: ariaResult.result };
+      entry.options = opts;
       entry.state = "managed-by-aria2";
     }
   } else {

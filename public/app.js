@@ -548,9 +548,13 @@ function render() {
     const engineType =
       t.isHls || t.backend === "HLS Engine"
         ? "HLS Stream"
-        : t.isTorrent
-          ? "BitTorrent"
-          : "Direct";
+        : t.isGDrive || t.backend === "GDrive Engine"
+          ? "Google Drive"
+          : t.isTorrent
+            ? "BitTorrent · aria2"
+            : t.backend === "aria2"
+              ? "HTTP · aria2"
+              : "Direct";
 
     let refs = rowElements.get(t.id);
     if (!refs) {

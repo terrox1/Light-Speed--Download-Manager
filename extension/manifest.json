@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "LSDM Stream & Download Sniffer",
   "version": "2.0.0",
-  "author": "LSDM Project",
+  "author": "Terrox",
   "homepage_url": "https://github.com/lsdm/lsdm",
   "description": "High-speed media sniffer and parallel download accelerator for LSDM.",
   "icons": {

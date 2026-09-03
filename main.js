@@ -3,6 +3,12 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, shell, dialog, Notif
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const crypto = require('crypto');
+
+// Create the RPC secret before loading server.js. The server can begin its
+// reconciliation timer immediately, so it must never observe an empty secret.
+const RPC_SECRET = process.env.ARIA2_SECRET || crypto.randomBytes(16).toString('hex');
+process.env.ARIA2_SECRET = RPC_SECRET;
 
 // Port sync fix: main.js and server.js used to each hard-code 3000. Set it
 // HERE, before requiring server.js, so both processes share one constant.
@@ -48,9 +54,14 @@ const ARIA_PORT = 6800;
 // spawned exe can actually execute (Windows can't exec from inside an asar).
 function findAriaExecutable() {
   const candidates = [
-    __dirname.replace('app.asar', 'app.asar.unpacked'), // packaged location
-    __dirname,                                          // dev location
-  ];
+    // electron-builder's asarUnpack location.
+    __dirname.replace(/app\.asar(?:[\\/]|$)/, (match) =>
+      match.replace('app.asar', 'app.asar.unpacked'),
+    ),
+    // Explicit resources path is more reliable for custom install layouts.
+    process.resourcesPath ? path.join(process.resourcesPath, 'app.asar.unpacked') : null,
+    __dirname,
+  ].filter(Boolean);
   for (const base of candidates) {
     const found = scan(path.join(base, 'tools'));
     if (found) return found;
@@ -74,6 +85,35 @@ function findAriaExecutable() {
 }
 
 // In main.js
+async function waitForAriaDaemon(timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = 'aria2 did not respond';
+  while (Date.now() < deadline) {
+    if (!ariaProcess) break;
+    try {
+      const response = await fetch(`http://127.0.0.1:${ARIA_PORT}/jsonrpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'lsdm-ready',
+          method: 'aria2.getVersion',
+          params: [`token:${RPC_SECRET}`],
+        }),
+        signal: AbortSignal.timeout(1000),
+      });
+      const payload = await response.json().catch(() => null);
+      if (response.ok && payload?.result?.version) return true;
+      lastError = payload?.error?.message || `HTTP ${response.status}`;
+    } catch (err) {
+      lastError = err?.message || String(err);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  console.error(`[lsdm] aria2 readiness check failed: ${lastError}`);
+  return false;
+}
+
 function startAriaDaemon() {
   const ariaPath = findAriaExecutable();
   if (!ariaPath) {
@@ -117,16 +157,20 @@ const args = [
   '--enable-peer-exchange=true',
   '--bt-enable-lpd=true',
   '--bt-max-peers=200',
-  // Torrent speed fix: hint expected swarm speed so aria2 actually pulls data
-  // from discovered peers instead of just idling connected to them
-  '--bt-request-peer-speed-limit=10M',
+  // Do not set bt-request-peer-speed-limit: a high threshold rejects slower
+  // peers, which is exactly what makes healthy swarms show peers but 0 B/s.
   '--bt-detach-seed-only=true',
   '--follow-torrent=true',
   // Speed tuning: keep more peers unchoked and request aggressively
   '--bt-max-open-files=256',
   '--bt-stop-timeout=0',
   '--bt-save-metadata=true',
-  '--force-sequential=true',
+  // Never force sequential piece requests: it serializes a torrent and can
+  // leave available peers idle. aria2's default piece selector is parallel.
+  '--force-sequential=false',
+  '--bt-tracker-connect-timeout=10',
+  '--bt-tracker-interval=60',
+  '--bt-enable-hook-after-hash-check=true',
   // Faster DHT bootstrap: seed entry points so we join the swarm quickly
   // instead of slowly discovering the network on first run
   '--dht-entry-point=router.bittorrent.com:6881',
@@ -149,15 +193,15 @@ const args = [
 
   console.log('Spawning aria2 daemon at:', ariaPath);
 
-  // Security: generate a random RPC secret so only this app can control aria2.
-  // Shared with server.js via env var; server prepends "token:<secret>" to calls.
-  const rpcSecret = require('crypto').randomBytes(16).toString('hex');
+  // Security: use the secret created before server.js was loaded so both sides
+  // always authenticate the same daemon, including during startup recovery.
+  const rpcSecret = RPC_SECRET;
   args.push(`--rpc-secret=${rpcSecret}`);
 
   ariaProcess = spawn(ariaPath, args, {
     cwd: ariaDir,
     windowsHide: true,
-    env: { ...process.env, ARIA2_SECRET: rpcSecret }
+    env: { ...process.env, ARIA2_SECRET: rpcSecret },
   });
 
   // Pass the same secret to the internal Express server
@@ -166,8 +210,12 @@ const args = [
   ariaProcess.stdout?.on('data', (d) => console.log(`[aria2] ${d}`));
   ariaProcess.stderr?.on('data', (d) => console.error(`[aria2 ERROR] ${d}`));
 
-  ariaProcess.on('exit', (code) => {
-    console.error(`aria2c process exited with code ${code}. Check ${logPath}`);
+  ariaProcess.on('error', (err) => {
+    console.error(`[lsdm] failed to start aria2c: ${err.message}. Executable: ${ariaPath}`);
+  });
+  ariaProcess.on('exit', (code, signal) => {
+    console.error(`aria2c process exited with code ${code ?? 'null'}${signal ? ` (signal ${signal})` : ''}. Check ${logPath}`);
+    ariaProcess = null;
   });
 }
 
@@ -505,8 +553,15 @@ app.on('activate', () => {
   }
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   startAriaDaemon();
+  // Do not expose a ready-looking window while the backend is still starting.
+  // This removes the first-click race in packaged builds where aria2 may need
+  // a few seconds to initialize its RPC listener and session file.
+  const ariaReady = await waitForAriaDaemon();
+  if (!ariaReady) {
+    console.error('[lsdm] aria2 is unavailable; downloads will be reported as backend failures.');
+  }
   createMainWindow();
   // Don't swallow tray creation errors. Tray APIs can fail when there's no
   // notification area visible (e.g. RDP without a taskbar, or a policy
