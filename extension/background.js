@@ -324,12 +324,81 @@ function markSent(url) {
   }, 500);
 }
 
+// Track gids we've already cancelled from prior sessions so we NEVER
+// re-capture them on browser restart — this is the core fix for the
+// "3000 failed downloads" storm.
+let cancelledGids = new Set();
+let gidsLoaded = false;
+let gidsLoadPromise = null;
+
+async function ensureCancelledGidsLoaded() {
+  if (gidsLoaded) return;
+  if (!gidsLoadPromise) gidsLoadPromise = loadCancelledGids();
+  await gidsLoadPromise;
+}
+
+async function loadCancelledGids() {
+  try {
+    const stored = await chrome.storage.local.get('cancelledDownloadGids');
+    if (Array.isArray(stored.cancelledDownloadGids)) {
+      cancelledGids = new Set(stored.cancelledDownloadGids);
+      // Prune entries older than 14 days
+      const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+      for (const [id, ts] of cancelledGids) {
+        if (ts < cutoff) cancelledGids.delete(id);
+      }
+    }
+  } catch {}
+  gidsLoaded = true;
+}
+
+let saveGidsTimer = null;
+function markGidCancelled(gid) {
+  cancelledGids.add(gid);
+  // Cap at 5000 entries
+  if (cancelledGids.size > 5000) {
+    const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    for (const [id, ts] of cancelledGids) {
+      if (ts < cutoff) cancelledGids.delete(id);
+    }
+  }
+  clearTimeout(saveGidsTimer);
+  saveGidsTimer = setTimeout(() => {
+    chrome.storage.local.set({
+      cancelledDownloadGids: Array.from(cancelledGids.entries()),
+      sentDownloadUrls: Array.from(sentUrls.entries())
+    }).catch(() => {});
+  }, 500);
+}
+
 loadSentUrls();
+loadCancelledGids();
 
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
   if (!autoCaptureEnabled) return;
   const url = downloadItem?.finalUrl || downloadItem?.url;
   if (!url) return;
+
+  // 3000-failed-files FIX: Skip any download that Chrome already reports as
+  // interrupted/cancelled at creation time — these are old failed downloads
+  // from prior sessions being replayed on browser restart. Never capture them.
+  if (downloadItem.state === 'interrupted' || downloadItem.state === 'cancelled') {
+    // Still cancel so Chrome doesn't sit there retrying them forever
+    await chrome.downloads.cancel(downloadItem.id).catch(() => {});
+    await chrome.downloads.removeFile(downloadItem.id).catch(() => {});
+    await chrome.downloads.erase({ id: downloadItem.id }).catch(() => {});
+    return;
+  }
+
+  // 3000-failed-files FIX: Skip downloads that have already been cancelled
+  // in a prior session (stored in chrome.storage.local)
+  await ensureCancelledGidsLoaded();
+  if (cancelledGids.has(downloadItem.id)) {
+    await chrome.downloads.cancel(downloadItem.id).catch(() => {});
+    await chrome.downloads.removeFile(downloadItem.id).catch(() => {});
+    await chrome.downloads.erase({ id: downloadItem.id }).catch(() => {});
+    return;
+  }
 
   // Wait for the dedup history before checking anything — see ensureSentUrlsLoaded()
   await ensureSentUrlsLoaded();
@@ -348,6 +417,8 @@ chrome.downloads.onCreated.addListener(async (downloadItem) => {
     // Still cancel Chrome's duplicate native download so the user doesn't get
     // a second local copy — but do NOT create another LSDM task.
     await chrome.downloads.cancel(downloadItem.id).catch(() => {});
+    await chrome.downloads.removeFile(downloadItem.id).catch(() => {});
+    await chrome.downloads.erase({ id: downloadItem.id }).catch(() => {});
     return;
   }
 
@@ -374,6 +445,12 @@ chrome.downloads.onCreated.addListener(async (downloadItem) => {
 
     // Remember this URL so startup re-downloads don't spawn LSDM tasks again
     markSent(url);
+    // Also mark the download ID so we never re-capture it on restart
+    markGidCancelled(downloadItem.id);
+
+    // Clean up Chrome's download record completely — no trace left
+    await chrome.downloads.removeFile(downloadItem.id).catch(() => {});
+    await chrome.downloads.erase({ id: downloadItem.id }).catch(() => {});
 
     // Show a badge on the extension icon so the user knows capture happened.
     // Counter-style: each pending add increments so the user sees N↓.
