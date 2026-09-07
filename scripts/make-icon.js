@@ -130,22 +130,19 @@ const png = Buffer.concat([
 ]);
 
 // ICO container with the single 256px PNG entry
+// ICONDIR (6 bytes) + ICONDIRENTRY (16 bytes, starting at offset 6)
 const ico = Buffer.alloc(22 + png.length);
-ico.writeUInt16LE(0, 0);
-ico.writeUInt16LE(1, 2);
-ico.writeUInt16LE(1, 4);
-ico[6] = 0;
-ico[7] = 0;
-ico[8] = 0;
-ico[9] = 0;
-ico[10] = 0;
-ico[11] = 0;
-ico[12] = 0;
-ico[13] = 0;
-ico.writeUInt16LE(1, 14);
-ico.writeUInt16LE(32, 16);
-ico.writeUInt32LE(png.length, 18);
-ico.writeUInt32LE(22, 22);
+ico.writeUInt16LE(0, 0); // reserved
+ico.writeUInt16LE(1, 2); // type = 1 (ICO)
+ico.writeUInt16LE(1, 4); // image count
+ico[6] = 0; // bWidth  0 == 256
+ico[7] = 0; // bHeight 0 == 256
+ico[8] = 0; // palette colors
+ico[9] = 0; // reserved
+ico.writeUInt16LE(1, 10); // wPlanes
+ico.writeUInt16LE(32, 12); // wBitCount
+ico.writeUInt32LE(png.length, 14); // dwBytesInRes
+ico.writeUInt32LE(22, 18); // dwImageOffset
 Buffer.from(png).copy(ico, 22);
 
 const out = path.join(__dirname, "..", "build", "icon.ico");
