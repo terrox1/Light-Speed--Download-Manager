@@ -10,16 +10,13 @@ const { spawn } = require("child_process");
 const ROOT = path.resolve(__dirname, "..");
 
 describe("LSDM smoke tests", () => {
-  test("server.js exposes the required engine endpoint", () => {
+  test("server.js exposes the required engine endpoints", () => {
     const src = fs.readFileSync(path.join(ROOT, "server.js"), "utf8");
-    // The main work is a single engine() dispatcher that ping/HTTP/WebSocket funnel through.
-    assert.match(
-      src,
-      /async function engine/,
-      "engine() dispatcher should exist",
-    );
-    assert.match(src, /aria2\b/, "aria2 engine should be routed");
-    assert.match(src, /\.m3u8|HLS/i, "HLS engine should be routed");
+    // All download paths funnel through the Express app (HTTP) + WebSocket.
+    assert.match(src, /app\.post\(["']\/api\/hls\/download/i, "HLS engine endpoint should exist");
+    assert.match(src, /isGDrive/i, "Google Drive engine should be routed");
+    assert.match(src, /drive\.usercontent\.google\.com/i, "GDrive engine streams from drive.usercontent.google.com");
+    assert.match(src, /aria2\b/i, "aria2 engine should be routed");
   });
 
   test("HLS engine includes AES-128 decryption", () => {
@@ -52,7 +49,7 @@ describe("startup hygiene", () => {
     });
     let booted = false;
     child.stdout.on("data", (d) => {
-      if (/listening|started/i.test(d.toString())) booted = true;
+      if (/LSDM Server running/i.test(d.toString())) booted = true;
     });
     child.stderr.on("data", () => {});
     const timer = setTimeout(() => {
