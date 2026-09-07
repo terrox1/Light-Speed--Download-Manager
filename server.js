@@ -7,7 +7,7 @@ const fsp = require("fs/promises");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 // Available when running inside the Electron main process (packaged app only).
 // Guarded require so `node server.js` in dev still works without Electron.
 let electronApp = null;
@@ -58,20 +58,37 @@ function spawnAriaForStandalone() {
       for (const e of entries) {
         const full = path.join(cur, e.name);
         if (e.isDirectory()) stack.push(full);
-        else if (e.name.toLowerCase() === "aria2c.exe") { ariaPath = full; break; }
+        // Windows ships aria2c.exe; Linux/macOS runs a bare `aria2c`.
+        else if (/^aria2c(\.exe)?$/i.test(e.name)) { ariaPath = full; break; }
       }
       if (ariaPath) break;
     }
     if (ariaPath) break;
   }
+  // Linux/macOS fallback: use an `aria2c` already on PATH (distro package).
+  if (!ariaPath && process.platform !== "win32") {
+    try {
+      const resolved = execFileSync("sh", ["-c", "command -v aria2c"], {
+        encoding: "utf8",
+      }).trim();
+      if (resolved) ariaPath = resolved;
+    } catch {}
+  }
   if (!ariaPath) {
-    console.warn("[lsdm] aria2c.exe not found in tools/ \u2014 downloads via aria2 will fail. Run tools/install-aria2.ps1 first.");
+    console.warn(
+      "[lsdm] aria2c not found in tools/ or PATH — downloads via aria2 will fail. " +
+        "Windows: run tools/install-aria2.ps1. " +
+        "Debian/Ubuntu: `sudo apt install aria2`. macOS: `brew install aria2`.",
+    );
     return;
   }
   const secret = crypto.randomBytes(16).toString("hex");
   process.env.ARIA2_SECRET = secret;
-  const ariaDir = path.dirname(ariaPath);
-  const sessionPath = path.join(ariaDir, "aria2.session");
+  // Session/metadata live in the writable app root (NOT next to a system
+  // binary in /usr/bin, which would be read-only).
+  const sessionPath = path.join(appRoot, "aria2.session");
+  const spawnOpts = { cwd: __dirname, stdio: "ignore" };
+  if (process.platform === "win32") spawnOpts.windowsHide = true;
   const proc = spawn(ariaPath, [
     "--enable-rpc=true",
     "--rpc-listen-all=false",
@@ -83,7 +100,7 @@ function spawnAriaForStandalone() {
     "--save-session-interval=30",
     "--bt-max-peers=200",
     "--seed-time=0",
-  ], { cwd: ariaDir, windowsHide: true, stdio: "ignore" });
+  ], spawnOpts);
   proc.on("exit", (code) => console.warn(`[lsdm] aria2 exited (code ${code}); restart it manually.`));
   console.log("[lsdm] spawned standalone aria2 at", ariaPath);
 }
@@ -2189,8 +2206,9 @@ server.on("error", (err) => {
   }
 });
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`LSDM Server running at http://127.0.0.1:${port}`);
+// Bind host is overridable (HOST=0.0.0.0 for the Docker image) — defaults to loopback for local use.
+server.listen(port, process.env.HOST || "127.0.0.1", () => {
+  console.log(`LSDM Server running at http://${process.env.HOST || "127.0.0.1"}:${port}`);
   if (!process.env.ARIA2_SECRET && !STANDALONE) {
     console.warn(
       "[LSDM] ARIA2_SECRET is not set yet. Download requests will wait for Electron to start aria2.",

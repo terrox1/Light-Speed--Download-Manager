@@ -7,6 +7,8 @@
   "scripts": {
     "start": "electron .",
     "server": "node server.js",
+    "start:server": "node server.js --standalone",
+    "test": "node --test tests/",
     "dist": "electron-builder --win"
   },
   "dependencies": {
