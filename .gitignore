@@ -6,6 +6,7 @@ config.json
 
 # --- aria2 binaries & runtime state (users install via tools/install-aria2.ps1) ---
 tools/aria2/
+*.session
 
 # --- Node ---
 node_modules/

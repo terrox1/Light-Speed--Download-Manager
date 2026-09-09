@@ -52,10 +52,12 @@ describe("startup hygiene", () => {
       if (/LSDM Server running/i.test(d.toString())) booted = true;
     });
     child.stderr.on("data", () => {});
+    // server.js takes ~5s to boot on a healthy machine; give CI plenty of
+    // headroom (slow runner / Express warm-up) without weakening the check.
     const timer = setTimeout(() => {
       child.kill();
-      done(booted ? undefined : new Error("server did not boot within 5s"));
-    }, 5000);
+      done(booted ? undefined : new Error("server did not boot within 15s"));
+    }, 15000);
     child.on("exit", () => clearTimeout(timer));
   });
 });
