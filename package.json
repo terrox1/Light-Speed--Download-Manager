@@ -8,10 +8,10 @@
     "start": "electron .",
     "server": "node server.js",
     "start:server": "node server.js --standalone",
-    "test": "node --test \"tests/**/*.test.js\"",
     "dist": "electron-builder --win --publish never",
     "dist:mac": "electron-builder --mac --publish never",
-    "dist:linux": "electron-builder --linux --publish never"
+    "dist:linux": "electron-builder --linux --publish never",
+    "test": "jest --runInBand --passWithNoTests"
   },
   "dependencies": {
     "express": "^4.18.4",
