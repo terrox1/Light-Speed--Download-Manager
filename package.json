@@ -8,7 +8,7 @@
     "start": "electron .",
     "server": "node server.js",
     "start:server": "node server.js --standalone",
-    "test": "jest --runInBand --passWithNoTests",
+    "test": "jest --runInBand --passWithNoTests --forceExit",
     "dist": "electron-builder --win --publish never",
     "dist:mac": "electron-builder --mac --publish never",
     "dist:linux": "electron-builder --linux --publish never"
