@@ -6,7 +6,6 @@ config.json
 
 # --- aria2 binaries & runtime state (users install via tools/install-aria2.ps1) ---
 tools/aria2/
-*.session
 
 # --- Node ---
 node_modules/
@@ -23,3 +22,12 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 tools/aria2_latest.zip
+.local/node-v22.14.0-win-x64.zip
+.local/node/node-v22.14.0-win-x64/CHANGELOG.md
+.gitignore
+.local/node/node-v22.14.0-win-x64/corepack
+.local/node/node-v22.14.0-win-x64/install_tools.bat
+.local/node/node-v22.14.0-win-x64/nodevars.bat
+.local/node/node-v22.14.0-win-x64/corepack.cmd
+.local/node/node-v22.14.0-win-x64/LICENSE
+.local/node/node-v22.14.0-win-x64/node.exe
