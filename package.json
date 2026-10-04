@@ -8,6 +8,10 @@
     "start": "electron .",
     "server": "node server.js",
     "start:server": "node server.js --standalone",
+<<<<<<< HEAD
+=======
+    "test": "jest --runInBand --passWithNoTests",
+>>>>>>> dea82314606e8077970bef6a8d339fff240e5131
     "dist": "electron-builder --win --publish never",
     "dist:mac": "electron-builder --mac --publish never",
     "dist:linux": "electron-builder --linux --publish never",
