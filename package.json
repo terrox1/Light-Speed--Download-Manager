@@ -57,8 +57,7 @@
       "target": [
         "dmg",
         "zip"
-      ],
-      "icon": "build/icon.icns"
+      ]
     },
     "linux": {
       "target": [
