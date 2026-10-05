@@ -2,7 +2,7 @@
   "name": "lsdm",
   "author": "Terrox",
   "version": "1.0.0",
-  "description": "LSDM — Light Speed Download Manager Pro",
+  "description": "LSDM — Light Speed Download Manager",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
